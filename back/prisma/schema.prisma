@@ -1,0 +1,66 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "mysql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id        Int     @id @default(autoincrement())
+  username  String  @unique
+  email     String  @unique
+  password  String
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  testResults TestResult[]
+
+  @@map("users")
+}
+
+model RiskCategory {
+  id          Int     @id @default(autoincrement())
+  name        String  @unique
+  description String  @db.Text
+  createdAt   DateTime @default(now())
+
+  testCases  TestCase[]
+  testResults TestResult[]
+
+  @@map("risk_categories")
+}
+
+model TestCase {
+  id          Int     @id @default(autoincrement())
+  categoryId  Int
+  category    RiskCategory @relation(fields: [categoryId], references: [id])
+  description String  @db.Text
+  examplePrompt String @db.Text
+  createdAt   DateTime @default(now())
+
+  testResults TestResult[]
+
+  @@map("test_cases")
+}
+
+model TestResult {
+  id          Int     @id @default(autoincrement())
+  userId      Int
+  user        User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  categoryId  Int
+  category    RiskCategory @relation(fields: [categoryId], references: [id])
+  testCaseId  Int?
+  testCase    TestCase? @relation(fields: [testCaseId], references: [id])
+  input       String  @db.Text
+  output      String  @db.Text
+  riskLevel   String  // "low", "medium", "high", "critical"
+  riskScore   Float   @default(0)
+  createdAt   DateTime @default(now())
+
+  @@map("test_results")
+}
