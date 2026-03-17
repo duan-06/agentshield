@@ -1,0 +1,102 @@
+# Llama Shield - Horizontal Pod Autoscaler
+
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: llama-shield-hpa
+  namespace: llama-shield
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: llama-shield
+  minReplicas: 1
+  maxReplicas: 10
+
+  # CPU 基于扩缩容
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 70
+
+  # 内存基于扩缩容
+  - type: Resource
+    resource:
+      name: memory
+      target:
+        type: Utilization
+        averageUtilization: 80
+
+  # 自定义指标 - 请求延迟
+  - type: Pods
+    pods:
+      metric:
+        name: llama_shield_request_latency_p99
+      target:
+        type: AverageValue
+        averageValue: "500m"
+
+  # 自定义指标 - 拦截率
+  - type: Pods
+    pods:
+      metric:
+        name: llama_shield_block_rate
+      target:
+        type: Value
+        value: "80"
+
+  # 行为配置
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+      - type: Percent
+        value: 50
+        periodSeconds: 60
+      - type: Pods
+        value: 2
+        periodSeconds: 60
+      selectPolicy: Min
+
+    scaleUp:
+      stabilizationWindowSeconds: 0
+      policies:
+      - type: Percent
+        value: 100
+        periodSeconds: 30
+      - type: Pods
+        value: 4
+        periodSeconds: 30
+      selectPolicy: Max
+
+---
+# PodDisruptionBudget
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: llama-shield-pdb
+  namespace: llama-shield
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app: llama-shield
+
+---
+# ResourceQuota
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: llama-shield-quota
+  namespace: llama-shield
+spec:
+  hard:
+    requests.cpu: "16"
+    requests.memory: "32Gi"
+    limits.cpu: "32"
+    limits.memory: "64Gi"
+    nvidia.com/gpu: "4"
+    persistentvolumeclaims: "10"

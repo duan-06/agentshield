@@ -1,0 +1,66 @@
+# Llama Shield - Kubernetes Service
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: llama-shield-service
+  namespace: llama-shield
+  labels:
+    app: llama-shield
+spec:
+  type: ClusterIP
+  ports:
+  - port: 80
+    targetPort: 8000
+    protocol: TCP
+    name: http
+  - port: 9090
+    targetPort: 9090
+    protocol: TCP
+    name: metrics
+  selector:
+    app: llama-shield
+
+---
+# Headless Service（用于有状态工作负载）
+apiVersion: v1
+kind: Service
+metadata:
+  name: llama-shield-headless
+  namespace: llama-shield
+spec:
+  clusterIP: None
+  ports:
+  - port: 8000
+    targetPort: 8000
+    name: http
+  selector:
+    app: llama-shield
+
+---
+# Ingress（可选）
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: llama-shield-ingress
+  namespace: llama-shield
+  annotations:
+    nginx.ingress.kubernetes.io/rewrite-target: /
+    nginx.ingress.kubernetes.io/proxy-body-size: "50m"
+spec:
+  ingressClassName: nginx
+  rules:
+  - host: llama-shield.example.com
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: llama-shield-service
+            port:
+              number: 80
+  tls:
+  - hosts:
+    - llama-shield.example.com
+    secretName: llama-shield-tls

@@ -1,0 +1,5 @@
+{
+  "dependencies": {
+    "@stackone/defender": "^0.4.5"
+  }
+}

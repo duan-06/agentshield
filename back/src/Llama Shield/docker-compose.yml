@@ -1,0 +1,191 @@
+# Llama Shield - Docker Compose 开发环境
+# 使用: docker-compose up -d
+
+version: '3.8'
+
+services:
+  # ==================== API 服务 ====================
+  llama-shield:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: llama-shield
+    ports:
+      - "8000:8000"
+      - "9090:9090"  # Prometheus metrics
+    environment:
+      # 应用配置
+      - APP_NAME=LlamaShield
+      - DEBUG=false
+
+      # 数据库
+      - POSTGRES_HOST=postgres
+      - POSTGRES_PORT=5432
+      - POSTGRES_DB=llama_shield
+      - POSTGRES_USER=llama_shield
+      - POSTGRES_PASSWORD=llama_shield_secure_password
+
+      # Redis
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+
+      # vLLM
+      - VLLM_HOST=vllm
+      - VLLM_PORT=8001
+      - VLLM_MODEL=meta-llama/Llama-3.1-70B-Instruct
+      - VLLM_TENSOR_PARALLEL_SIZE=1
+
+      # LlamaFirewall
+      - LLAMAFIREWALL_MODE=strict
+      - LLAMAFIREWALL_BLOCK_THRESHOLD=0.8
+      - POLICY_PATH=/app/config/policy.yaml
+
+    volumes:
+      - ./app:/app/app
+      - ./config:/app/config
+      - ./logs:/app/logs
+      - model_cache:/models
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - llama-shield-network
+    restart: unless-stopped
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+  # ==================== PostgreSQL 数据库 ====================
+  postgres:
+    image: postgres:16-alpine
+    container_name: llama-shield-postgres
+    environment:
+      - POSTGRES_DB=llama_shield
+      - POSTGRES_USER=llama_shield
+      - POSTGRES_PASSWORD=llama_shield_secure_password
+      - PGDATA=/var/lib/postgresql/data/pgdata
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U llama_shield"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - llama-shield-network
+    restart: unless-stopped
+
+  # ==================== Redis 缓存 ====================
+  redis:
+    image: redis:7-alpine
+    container_name: llama-shield-redis
+    command: redis-server --appendonly yes
+    volumes:
+      - redis_data:/data
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - llama-shield-network
+    restart: unless-stopped
+
+  # ==================== vLLM 推理服务 ====================
+  vllm:
+    image: vllm/vllm:latest
+    container_name: llama-shield-vllm
+    ports:
+      - "8001:8001"
+    environment:
+      - MODEL=meta-llama/Llama-3.1-70B-Instruct
+      - TENSOR_PARALLEL_SIZE=1
+      - GPU_MEMORY_UTILIZATION=0.9
+      - MAX_NUM_SEQS=256
+      - MAX_MODEL_LEN=8192
+      - Enforcement_eager=false
+      - HF_TOKEN=${HF_TOKEN:-}
+    volumes:
+      - model_cache:/models
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    networks:
+      - llama-shield-network
+    restart: unless-stopped
+
+  # ==================== Prometheus 监控 ====================
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: llama-shield-prometheus
+    ports:
+      - "9091:9090"
+    volumes:
+      - ./config/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+    networks:
+      - llama-shield-network
+    restart: unless-stopped
+
+  # ==================== Grafana 可视化 ====================
+  grafana:
+    image: grafana/grafana:latest
+    container_name: llama-shield-grafana
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./config/grafana/dashboards:/etc/grafana/provisioning/dashboards
+    depends_on:
+      - prometheus
+    networks:
+      - llama-shield-network
+    restart: unless-stopped
+
+  # ==================== 模型下载（可选） ====================
+  model-downloader:
+    build:
+      context: .
+      dockerfile: Dockerfile.models
+    container_name: llama-shield-model-downloader
+    environment:
+      - HF_TOKEN=${HF_TOKEN:-}
+      - MODEL_NAME=meta-llama/Llama-3.1-70B-Instruct
+    volumes:
+      - model_cache:/models
+    networks:
+      - llama-shield-network
+    restart: "no"
+
+# ==================== 网络 ====================
+networks:
+  llama-shield-network:
+    driver: bridge
+
+# ==================== 卷 ====================
+volumes:
+  postgres_data:
+  redis_data:
+  prometheus_data:
+  grafana_data:
+  model_cache:

@@ -1,0 +1,171 @@
+# Llama Shield - 安全策略配置
+# 可配置的防护策略，支持 CWE、危害类别等
+
+# ==================== 通用配置 ====================
+version: "1.0.0"
+mode: strict  # permissive | strict | balanced
+
+# ==================== 输入策略 ====================
+input_policy:
+  # Prompt Guard 配置
+  prompt_guard:
+    enabled: true
+    threshold: 0.5
+
+    # 越狱攻击类型
+    jailbreak_categories:
+      - role_reversal  # 角色反转
+      - distortion    # 扭曲/变形
+      - privilege_escalation  # 权限提升
+      - context_manipulation  # 上下文操纵
+
+    # 注入攻击类型
+    injection_categories:
+      - direct_injection   # 直接注入
+      - indirect_injection # 间接注入
+      - token_smuggling    # Token 走私
+
+  # Alignment Check 配置
+  alignment_check:
+    enabled: true
+    threshold: 0.6
+
+    # 多轮攻击检测
+    multi_turn_detection:
+      enabled: true
+      max_turns: 10
+
+      # 目标劫持检测
+      goal_hijacking:
+        enabled: true
+        sensitivity: medium  # low | medium | high
+
+    # 对话操纵检测
+    conversation_manipulation:
+      enabled: true
+      suspicious_turn_threshold: 3
+
+# ==================== 输出策略 ====================
+output_policy:
+  # Llama Guard 配置（MLCommons 分类）
+  llama_guard:
+    enabled: true
+    threshold: 0.5
+
+    # 危害类别（MLCommons 标准）
+    categories:
+      - hate_speech         # 仇恨言论
+      - harassment          # 骚扰
+      - sexually_explicit   # 性暴露内容
+      - dangerous_content   # 危险内容
+      - violence            # 暴力
+
+    # 自定义类别
+    custom_categories:
+      - name: "medical_advice"
+        description: "未经认证的医疗建议"
+        threshold: 0.7
+
+      - name: "legal_advice"
+        description: "未授权的法律建议"
+        threshold: 0.7
+
+      - name: "financial_advice"
+        description: "未授权的金融建议"
+        threshold: 0.7
+
+  # CodeShield 配置
+  codeshield:
+    enabled: true
+    threshold: 0.5
+
+    # CWE 漏洞类别
+    cwe_categories:
+      # 注入类
+      - CWE-79    # XSS
+      - CWE-89    # SQL 注入
+      - CWE-94    # 代码注入
+      - CWE-78    # OS 命令注入
+
+      # 敏感信息
+      - CWE-200   # 信息泄露
+      - CWE-798  # 硬编码凭证
+
+      # 安全配置
+      - CWE-502  # 不安全反序列化
+
+    # 严重程度阈值
+    severity_threshold: medium  # low | medium | high | critical
+
+    # 代码语言
+    supported_languages:
+      - python
+      - javascript
+      - typescript
+      - java
+      - go
+      - rust
+
+# ==================== 速率限制 ====================
+rate_limit:
+  enabled: true
+
+  # 全局限流
+  global:
+    requests: 100
+    period: 60  # 秒
+
+  # 用户限流
+  per_user:
+    requests: 20
+    period: 60
+
+  # IP 限流
+  per_ip:
+    requests: 50
+    period: 60
+
+# ==================== 日志配置 ====================
+logging:
+  level: info  # debug | info | warning | error
+  log_requests: true
+  log_responses: true
+  log_scores: true
+
+  # 敏感数据脱敏
+  sanitization:
+    enabled: true
+    remove_pii: true
+    mask_scores: true  # 不暴露内部评分
+
+# ==================== 响应配置 ====================
+response:
+  # 阻断响应
+  blocked:
+    status_code: 403
+    include_reason: true
+    safe_message: "Request blocked by security policy"
+
+  # 错误响应
+  error:
+    status_code: 500
+    include_request_id: true
+    safe_message: "Internal server error"
+
+# ==================== 实验性功能 ====================
+experimental:
+  # 自适应阈值
+  adaptive_threshold:
+    enabled: false
+    min_threshold: 0.5
+    max_threshold: 0.95
+
+  # 在线学习
+  online_learning:
+    enabled: false
+    feedback_endpoint: /api/v1/feedback
+
+  # 威胁情报
+  threat_intelligence:
+    enabled: false
+    update_interval: 3600  # 秒
