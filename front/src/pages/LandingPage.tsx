@@ -149,7 +149,7 @@ export default function LandingPage() {
               onClick={handleTryExample}
               className="py-4 px-8 bg-blue-500 hover:bg-blue-600 text-white font-semibold rounded-lg transition-colors text-lg"
             >
-              Try Example
+              示例体验
             </motion.button>
             <motion.button
               initial={{ opacity: 0, x: 20 }}
@@ -158,7 +158,7 @@ export default function LandingPage() {
               onClick={handleBringYourOwn}
               className="py-4 px-8 bg-purple-500 hover:bg-purple-600 text-white font-semibold rounded-lg transition-colors text-lg"
             >
-              Bring Your Own Risk
+              自定义风险
             </motion.button>
           </div>
         </div>
@@ -183,8 +183,8 @@ export default function LandingPage() {
             <div>
               <h4 className="text-white font-semibold mb-4">产品</h4>
               <ul className="space-y-2 text-gray-400 text-sm">
-                <li><a href="#" className="hover:text-blue-400 transition-colors">Try Example</a></li>
-                <li><a href="#" className="hover:text-blue-400 transition-colors">Bring Your Own Risk</a></li>
+                <li><a href="#" className="hover:text-blue-400 transition-colors">示例体验</a></li>
+                <li><a href="#" className="hover:text-blue-400 transition-colors">自定义风险</a></li>
                 <li><a href="#" className="hover:text-blue-400 transition-colors">文档</a></li>
               </ul>
             </div>
