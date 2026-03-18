@@ -2,6 +2,7 @@ import { Router, Response } from 'express';
 import { PrismaClient } from '@prisma/client';
 import { authMiddleware, AuthRequest } from '../middleware/auth';
 import { testEvaluateSchema } from '../validators/schemas';
+import { llamaShieldService } from '../services/llamaShield';
 
 const router = Router();
 const prisma = new PrismaClient();
@@ -25,39 +26,70 @@ router.get('/categories', async (req: AuthRequest, res: Response) => {
   }
 });
 
-// Evaluate a test (placeholder for actual evaluation logic)
+// Evaluate a test - 调用 Llama Shield 进行 AI 安全检测
 router.post('/evaluate', authMiddleware, async (req: AuthRequest, res: Response) => {
   try {
     const { error, value } = testEvaluateSchema.validate(req.body);
-    
+
     if (error) {
       return res.status(400).json({ success: false, message: error.details[0].message });
     }
 
-    // TODO: Implement actual evaluation logic here
-    // This would call your AI safety evaluation service
-    const riskLevel = 'low'; // Placeholder
-    const riskScore = 0.2; // Placeholder
+    const { categoryId, input } = value;
+
+    // 构建消息格式
+    const messages = [{ role: 'user', content: input }];
+
+    // 设置 Llama Shield 的认证 Token
+    const authHeader = req.headers.authorization;
+    if (authHeader) {
+      const token = authHeader.replace('Bearer ', '');
+      llamaShieldService.setToken(token);
+    }
+
+    // 调用 Llama Shield 进行输入扫描
+    const scanResult = await llamaShieldService.scanInput(messages);
+
+    // 确定风险等级
+    let riskLevel = 'low';
+    if (scanResult.is_blocked) {
+      riskLevel = scanResult.score > 0.8 ? 'critical' : 'high';
+    } else if (scanResult.score > 0.5) {
+      riskLevel = 'medium';
+    }
+
+    // 生成模拟输出（实际应由 Llama Shield 返回）
+    const output = scanResult.is_blocked
+      ? `[BLOCKED by ${scanResult.blocked_by}] ${scanResult.blocked_reason}`
+      : 'Content passed security check.';
 
     const testResult = await prisma.testResult.create({
       data: {
         userId: req.userId!,
-        categoryId: value.categoryId,
-        input: value.input,
-        output: 'Evaluation result placeholder', // Replace with actual output
+        categoryId,
+        input,
+        output,
         riskLevel,
-        riskScore,
+        riskScore: scanResult.score,
       },
     });
 
     res.json({
       success: true,
-      message: 'Test evaluated successfully',
-      data: testResult,
+      message: scanResult.is_blocked ? 'Input blocked by security policy' : 'Test evaluated successfully',
+      data: {
+        ...testResult,
+        scanResult: {
+          is_blocked: scanResult.is_blocked,
+          blocked_by: scanResult.blocked_by,
+          blocked_reason: scanResult.blocked_reason,
+          score: scanResult.score,
+        },
+      },
     });
-  } catch (error) {
-    console.error(error);
-    res.status(500).json({ success: false, message: 'Evaluation failed' });
+  } catch (error: any) {
+    console.error('Evaluation failed:', error);
+    res.status(500).json({ success: false, message: 'Evaluation failed: ' + error.message });
   }
 });
 
