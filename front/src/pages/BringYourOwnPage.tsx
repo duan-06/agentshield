@@ -51,7 +51,7 @@ export default function BringYourOwnPage() {
       const response = await testsAPI.getHistory();
       setHistory(response.data.data);
     } catch (err) {
-      setError('Failed to load history');
+      setError('加载历史记录失败');
     } finally {
       setHistoryLoading(false);
     }
@@ -81,7 +81,7 @@ export default function BringYourOwnPage() {
     <div className="min-h-screen bg-gradient-to-br from-slate-900 via-slate-800 to-slate-900 pt-8">
       <div className="max-w-7xl mx-auto px-4 py-8">
         <div className="flex justify-between items-center mb-8">
-          <h1 className="text-3xl font-bold text-white">Bring Your Own Risk</h1>
+          <h1 className="text-3xl font-bold text-white">自定义风险评估</h1>
           <motion.button
             whileHover={{ scale: 1.05 }}
             whileTap={{ scale: 0.95 }}
