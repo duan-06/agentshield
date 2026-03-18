@@ -81,7 +81,7 @@ export default function Navbar() {
                         : 'text-gray-400 hover:text-white'
                     }`}
                   >
-                    Try Example
+                    示例体验
                   </button>
                   <button
                     onClick={() => navigate('/bring-your-own')}
@@ -91,7 +91,7 @@ export default function Navbar() {
                         : 'text-gray-400 hover:text-white'
                     }`}
                   >
-                    Bring Your Own Risk
+                    自定义风险
                   </button>
                 </>
               )}
