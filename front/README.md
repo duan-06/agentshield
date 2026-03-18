@@ -11,18 +11,23 @@ npm run dev
 
 访问 `http://localhost:5173`
 
-> 后端服务需在 `http://localhost:8000` 运行（FastAPI）
-
 ## 项目结构
 
 ```
 src/
-├── pages/           # 页面组件
-├── components/      # 可复用组件
-├── services/        # API 请求封装（axios）
-├── store/           # Zustand 全局状态
-├── App.tsx          # 路由配置
-└── main.tsx         # 入口文件
+├── pages/              # 页面组件
+│   ├── LandingPage.tsx
+│   ├── LoginPage.tsx
+│   ├── BringYourOwnPage.tsx
+│   └── TryExamplePage.tsx
+├── components/         # 可复用组件
+│   └── Navbar.tsx
+├── services/           # API 请求封装
+│   └── api.ts
+├── store/              # Zustand 全局状态
+│   └── authStore.ts
+├── App.tsx             # 路由配置
+└── main.tsx            # 入口文件
 ```
 
 ## 技术栈
@@ -39,12 +44,12 @@ src/
 
 ## 环境配置
 
-`vite.config.ts` 中配置后端代理，默认指向 `http://localhost:8000`（FastAPI）：
+`vite.config.ts` 中配置后端代理，指向 Express 后端 (端口 3001)：
 
 ```ts
 server: {
   proxy: {
-    '/api': 'http://localhost:8000',
+    '/api': 'http://localhost:3001',
   }
 }
 ```

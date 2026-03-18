@@ -526,32 +526,32 @@ class LlamaFirewallManager:
                 metadata={"error": str(e)}
             )
 
-    async def alignment_check_with_qwen(
+    async def alignment_check_with_minimax(
         self,
         original_goal: str,
-        conversation_trace: List[Dict[str, str]],
-        vllm_llm=None
+        conversation_trace: List[Dict[str, str]]
     ) -> FirewallScanResult:
         """
-        使用 Qwen 模型兼任 Alignment Check
+        使用 MiniMax API 进行 Alignment Check
 
         通过 few-shot Chain-of-Thought 方式检测目标劫持。
-        复用主推理模型，无需额外显存开销。
+        使用 MiniMax API 进行推理，无需本地模型。
 
         Args:
             original_goal: 用户原始目标
             conversation_trace: 对话轨迹
-            vllm_llm: vLLM LLM 实例
 
         Returns:
             FirewallScanResult: 审计结果
         """
-        if vllm_llm is None:
-            logger.warning("vLLM not available, skipping Alignment Check")
+        # 检查 MiniMax API 是否可用
+        minimax_api_key = os.getenv("MINIMAX_API_KEY")
+        if not minimax_api_key:
+            logger.warning("MiniMax API not configured, skipping Alignment Check")
             return FirewallScanResult(
                 is_blocked=False,
                 decision=ScanDecision.ALLOW.value,
-                metadata={"error": "vLLM not available"}
+                metadata={"error": "MiniMax API not configured"}
             )
 
         try:
@@ -574,25 +574,34 @@ class LlamaFirewallManager:
 
 请一步步思考后给出最终判断。"""
 
-            # 使用 vLLM 生成
-            from vllm import SamplingParams
-            sampling_params = SamplingParams(
-                temperature=0.0,  # 确定性输出
-                max_tokens=150,   # 简短结论
-                top_p=1.0,
+            # 使用 MiniMax API 生成
+            from openai import AsyncOpenAI
+
+            client = AsyncOpenAI(
+                api_key=minimax_api_key,
+                base_url=os.getenv("MINIMAX_BASE_URL", "https://api.minimax.chat/v1")
             )
 
-            outputs = vllm_llm.generate([prompt], sampling_params)
-            response = outputs[0].outputs[0].text
+            response = await client.chat.completions.create(
+                model=os.getenv("MINIMAX_MODEL", "MiniMax-M2.5"),
+                messages=[
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.0,  # 确定性输出
+                max_tokens=150,   # 简短结论
+                top_p=1.0
+            )
+
+            response_text = response.choices[0].message.content
 
             # 解析结果
-            decision, reason = self._parse_alignment_decision(response)
+            decision, reason = self._parse_alignment_decision(response_text)
 
             if decision == "BLOCK":
                 logger.warning(
                     f"Alignment Check blocked: {reason}",
                     original_goal=original_goal,
-                    response=response
+                    response=response_text
                 )
                 return FirewallScanResult(
                     is_blocked=True,
@@ -600,14 +609,14 @@ class LlamaFirewallManager:
                     blocked_by="AlignmentCheck",
                     blocked_reason=reason,
                     score=0.8,
-                    metadata={"llm_response": response}
+                    metadata={"llm_response": response_text}
                 )
 
             return FirewallScanResult(
                 is_blocked=False,
                 decision=ScanDecision.ALLOW.value,
                 score=0.2,
-                metadata={"llm_response": response}
+                metadata={"llm_response": response_text}
             )
 
         except Exception as e:
