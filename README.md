@@ -1,56 +1,88 @@
 # AgentShield - AI 安全护栏系统
 
-一套完整的 AI 安全护栏解决方案，用于防护注入攻击、越狱攻击、有害内容过滤等。
+基于 Meta PurpleLlama/LlamaFirewall 的完整 AI 安全护栏解决方案，防护越狱攻击、Prompt 注入、代码安全漏洞等威胁。
+
+## 系统架构
+
+```
+前端 (React + TypeScript)
+        ↓ HTTP
+FastAPI 后端（统一入口，端口 8000）
+├── 用户认证（JWT + bcrypt）
+├── 测试管理（评估 / 历史 / 统计）
+├── LlamaFirewall 护栏引擎
+│   ├── Prompt Guard（越狱/注入检测）
+│   └── CodeShield（代码漏洞检测）
+└── MySQL 数据库（agentshield）
+```
 
 ## 快速开始
 
-### 后端启动
+### 1. 启动后端（Python FastAPI）
+
 ```bash
-cd back
-npm install
+cd back/src/Llama Shield
+
+# 安装依赖
+pip install -i https://pypi.tuna.tsinghua.edu.cn/simple -r requirements.txt
+
+# 配置环境变量
 cp .env.example .env
-# 编辑 .env 配置数据库
-npm run prisma:generate
-npm run prisma:migrate
-npm run prisma:seed
-npm run dev
+# 编辑 .env，填写 MySQL 连接信息和 JWT_SECRET
+
+# 启动服务
+python -m uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 ```
 
-### 前端启动
+### 2. 启动前端（React）
+
 ```bash
 cd front
 npm install
 npm run dev
 ```
 
-访问 `http://localhost:3000`
+访问 `http://localhost:5173`
 
 ## 项目结构
 
 ```
 agentshield/
-├── front/                    # React 前端应用
+├── front/                          # React 前端应用
 │   ├── src/
-│   │   ├── pages/           # 4 个页面组件
-│   │   ├── services/        # API 服务
-│   │   ├── store/           # 状态管理
+│   │   ├── pages/                 # 页面组件
+│   │   ├── services/              # API 服务
+│   │   ├── store/                 # Zustand 状态管理
 │   │   └── App.tsx
 │   └── package.json
 │
-├── back/                     # Express 后端应用
-│   ├── src/
-│   │   ├── routes/          # API 路由
-│   │   ├── middleware/      # 认证中间件
-│   │   ├── validators/      # 数据验证
-│   │   └── index.ts
-│   ├── prisma/
-│   │   ├── schema.prisma    # 数据库模型
-│   │   └── seed.ts          # 初始化脚本
-│   └── package.json
+├── back/                          # 后端目录
+│   ├── prisma/                    # Prisma Schema（MySQL 表结构参考）
+│   │   ├── schema.prisma
+│   │   └── seed.ts                # 初始化数据脚本
+│   └── src/
+│       └── Llama Shield/          # ★ 统一后端（FastAPI + LlamaFirewall）
+│           ├── app/
+│           │   ├── main.py        # FastAPI 主入口，注册所有路由
+│           │   ├── firewall.py    # LlamaFirewall 护栏引擎
+│           │   ├── db.py          # MySQL 异步连接（aiomysql）
+│           │   ├── db_models.py   # SQLAlchemy 数据模型
+│           │   ├── monitoring.py  # Prometheus 指标采集
+│           │   ├── models.py      # Pydantic 请求/响应模型
+│           │   └── routes/        # 业务路由
+│           │       ├── auth.py    # 注册 / 登录
+│           │       ├── tests.py   # 护栏评估 / 历史 / 统计
+│           │       └── stats.py   # 图表 / 概览数据
+│           ├── config/
+│           │   └── policy.yaml    # 护栏策略配置
+│           ├── tests/
+│           │   └── test_jailbreak.py
+│           ├── .env               # 本地环境变量（不提交）
+│           ├── .env.example       # 环境变量模板
+│           ├── requirements.txt   # Python 依赖
+│           └── Dockerfile
 │
-└── 文档
-    ├── README.md            # 本文件
-    └── DEPLOYMENT.md        # 部署指南
+└── README.md                      # 本文件
 ```
 
 ## 技术栈
@@ -59,156 +91,127 @@ agentshield/
 - React 18 + TypeScript
 - Tailwind CSS + Framer Motion
 - Zustand + Axios + React Router
+- ECharts 数据可视化
 
 ### 后端
-- Express + TypeScript
-- Prisma ORM + MySQL
-- JWT + Bcrypt + Joi
+- Python 3.10+
+- FastAPI + Uvicorn
+- LlamaFirewall 1.0.3（Meta PurpleLlama）
+  - Prompt Guard 2（`meta-llama/Llama-Prompt-Guard-2-86M`）
+  - CodeShield（CWE 漏洞检测）
+- SQLAlchemy 2.x + aiomysql（异步 MySQL）
+- passlib + bcrypt（密码哈希）
+- python-jose（JWT）
+- structlog（结构化日志）
 
-## 核心功能
-
-### 用户认证
-- 注册/登录（用户名仅英文数字，密码至少8字符）
-- JWT token 认证
-- 密码 bcrypt 加密
-
-### 测试功能
-- **Try Example**: 预设测试用例
-- **Bring Your Own Risk**: 自定义测试
-- 历史记录管理
-- 风险等级分类
-
-### 数据管理
-- 用户数据存储
-- 测试结果记录
-- 统计数据生成
+### 数据库
+- MySQL 8.0+
+- 数据库名：`agentshield`
 
 ## API 端点
 
 ### 认证
 ```
-POST /api/auth/register
-POST /api/auth/login
+POST /api/auth/register    # 用户注册
+POST /api/auth/login       # 用户登录
 ```
 
-### 测试
+### 测试与护栏评估
 ```
-GET /api/tests/categories
-POST /api/tests/evaluate
-GET /api/tests/history
-GET /api/tests/stats
+GET  /api/tests/categories  # 获取风险类别
+POST /api/tests/evaluate    # ★ 核心：AI 护栏评估
+GET  /api/tests/history     # 获取测试历史
+GET  /api/tests/stats       # 按风险等级统计
 ```
 
-### 统计
+### 统计与图表
 ```
-GET /api/stats/charts
-GET /api/stats/overview
+GET /api/stats/charts       # 风险分布 + 分类图表
+GET /api/stats/overview     # 总量 / 危险数 / 平均分
+```
+
+### 原始聊天接口（含护栏）
+```
+POST /api/v1/chat           # 完整对话（输入扫描 + 推理 + 输出扫描）
+GET  /health                # 健康检查
 ```
 
 ## 数据库表
 
 | 表名 | 说明 |
 |------|------|
-| users | 用户信息 |
-| risk_categories | 风险类别 |
-| test_cases | 测试用例 |
-| test_results | 测试结果 |
+| `users` | 用户信息 |
+| `risk_categories` | 风险类别 |
+| `test_cases` | 预设测试用例 |
+| `test_results` | 测试结果（含护栏扫描详情）|
+| `audit_logs` | LlamaFirewall 审计日志 |
 
 ## 环境配置
 
+`back/src/Llama Shield/.env` 关键配置项：
+
+```env
+# MySQL
+MYSQL_HOST=localhost
+MYSQL_PORT=3306
+MYSQL_DB=agentshield
+MYSQL_USER=root
+MYSQL_PASSWORD=123456
+
+# JWT（与前端保持一致）
+JWT_SECRET=your-secret-key-change-in-production
+
+# LlamaFirewall
+LLAMAFIREWALL_MODE=strict
+LLAMAFIREWALL_ENABLE_INPUT_SCAN=true
+LLAMAFIREWALL_ENABLE_OUTPUT_SCAN=true
+
+# 可选：MiniMax API 推理
+USE_MINIMAX_API=false
+MINIMAX_API_KEY=
+
+# HuggingFace Token（Prompt Guard 模型下载）
+HF_TOKEN=
 ```
-DATABASE_URL=mysql://root:password@localhost:3306/agentshield
-JWT_SECRET=your-secret-key
-PORT=3001
-NODE_ENV=development
-```
+
+## LlamaFirewall 防护层
+
+| Scanner | 检测目标 | 触发条件 |
+|---------|---------|----------|
+| **Prompt Guard** | 越狱提示词、Prompt 注入攻击 | 用户输入扫描 |
+| **CodeShield** | CWE 代码安全漏洞 | 模型输出扫描 |
+| **Alignment Check** | 多轮目标劫持（实验性）| 默认关闭 |
+
+风险等级映射：
+- `score ≥ 0.7` 或 `is_blocked = true` → **critical**
+- `score ≥ 0.4` → **high**  
+- `score ≥ 0.0` → **medium / low**
 
 ## 常用命令
 
-### 后端
 ```bash
-npm run dev              # 启动开发服务器
-npm run build            # 构建生产版本
-npm run prisma:migrate   # 运行数据库迁移
-npm run prisma:seed      # 初始化示例数据
-npm run prisma:studio    # 打开 Prisma Studio
+# 启动后端（开发模式，自动热重载）
+cd "back/src/Llama Shield"
+python -m uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+
+# 启动前端
+cd front
+npm run dev
+
+# 初始化数据库示例数据（使用 Prisma seed）
+cd back
+npm run prisma:seed
+
+# 运行越狱测试基准
+cd "back/src/Llama Shield"
+pytest tests/test_jailbreak.py -v
 ```
 
-### 前端
-```bash
-npm run dev              # 启动开发服务器
-npm run build            # 构建生产版本
-npm run preview          # 预览生产版本
-```
+## 参考资源
 
-## 后续开发 - AI 护栏系统集成
-
-### 系统架构
-
-AI 护栏系统放在 `back/src/services/aiShield/` 目录：
-
-```
-back/src/services/
-├── aiShield/              # AI 护栏系统 (从 GitHub 克隆)
-│   ├── src/
-│   │   ├── index.ts       # 导出接口
-│   │   ├── detector.ts    # 威胁检测
-│   │   ├── models/        # 检测模型
-│   │   └── utils/         # 工具函数
-│   └── package.json
-└── api.ts
-```
-
-### 集成步骤
-
-1. **克隆护栏系统**
-   ```bash
-   cd back/src/services
-   git clone <your-ai-shield-repo> aiShield
-   cd aiShield && npm install
-   ```
-
-2. **在测试路由中使用**
-   ```typescript
-   // back/src/routes/tests.ts
-   import { aiShield } from '../services/aiShield';
-   
-   router.post('/evaluate', authMiddleware, async (req, res) => {
-     const evaluation = await aiShield.evaluate(input, categoryId);
-     const testResult = await prisma.testResult.create({
-       data: {
-         userId: req.userId,
-         categoryId,
-         input,
-         output: JSON.stringify(evaluation.details),
-         riskLevel: evaluation.riskLevel,
-         riskScore: evaluation.riskScore,
-       },
-     });
-     res.json({ success: true, data: testResult });
-   });
-   ```
-
-3. **护栏系统接口规范**
-   ```typescript
-   interface EvaluationResult {
-     riskLevel: 'low' | 'medium' | 'high' | 'critical';
-     riskScore: number;  // 0-1
-     threats: string[];
-     details: Record<string, any>;
-   }
-
-   interface AIShield {
-     evaluate(input: string, categoryId: number): Promise<EvaluationResult>;
-     detectPromptInjection(input: string): Promise<boolean>;
-     detectJailbreak(input: string): Promise<boolean>;
-     filterHarmfulContent(input: string): Promise<string>;
-   }
-   ```
-
-## 详细文档
-
-- [部署指南](./DEPLOYMENT.md) - 完整的部署和测试说明
+- [LlamaFirewall PyPI](https://pypi.org/project/llamafirewall/)
+- [PurpleLlama GitHub](https://github.com/meta-llama/PurpleLlama/tree/main/LlamaFirewall)
+- [LlamaFirewall 论文](https://arxiv.org/pdf/2505.03574.pdf)
 
 ## 许可证
 

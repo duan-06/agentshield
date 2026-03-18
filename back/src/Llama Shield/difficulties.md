@@ -1,121 +1,116 @@
 # Llama Shield 困难记录
 
-## 2026-03-16 LlamaFirewall API 假设错误
+## 2026-03-18 Express → FastAPI 迁移：MySQL 异步驱动
 
-### 问题描述
-- 之前编写的代码基于假设的 LlamaFirewall API
-- 实际安装 `pip install llamafirewall` 后发现 API 完全不同
+### 问题
+原 Express 后端用 MySQL，Llama Shield 原设计用 PostgreSQL，迁移时需统一数据库。
 
-### 实际 API vs 假设
-| 项目 | 实际 API | 假设（错误） |
-|------|----------|-------------|
-| 包版本 | 1.0.3 | 2026.1.0 ❌ |
-| ScannerType | PROMPT_GUARD, CODE_SHIELD, AGENT_ALIGNMENT | LLAMA_GUARD, ALIGNMENT_CHECK ❌ |
-| Decision | ScanDecision.BLOCK/ALLOW | Decision.DENY ❌ |
-| 初始化 | LlamaFirewall(scanners={Role: [...]}) | LlamaFirewall(mode=..., threshold=...) ❌ |
-| 扫描方法 | scan(input=Message, trace=Trace) | scan(messages=..., scanner_type=...) ❌ |
+### 方案对比
+| 方案 | 结论 |
+|------|------|
+| 继续用 PostgreSQL | 需额外安装，增加运维成本 ❌ |
+| `aiomysql` + SQLAlchemy 2.x | 直接复用已有 MySQL ✅ |
 
-### 尝试方案
-1. 尝试查找 llamafirewall 官方文档
-2. 通过 GitHub API 获取实际源码
-3. 分析源码中的实际 API
-4. 访问官方文档页面 https://meta-llama.github.io/PurpleLlama/LlamaFirewall/
-5. 从 GitHub examples/ 获取官方示例代码验证
-
-### 最终方案
-- 完全重写 app/firewall.py 使用实际 API
-- 更新 requirements.txt 版本号
-- 验证 API 兼容性
+### 解决
+- 新建 `app/db.py`（异步 MySQL 连接，替代原 `database.py`）
+- 新建 `app/db_models.py`（User / RiskCategory / TestCase / TestResult / AuditLog）
+- 连接 URL：`mysql+aiomysql://user:pass@host:port/db?charset=utf8mb4`
+- 安装：`pip install aiomysql PyMySQL`
 
 ### 状态
 ✅ 已解决
 
 ---
 
-## 2026-03-16 补充规则 - API 复查
+## 2026-03-18 main.py 中文编码导致 StrReplace 失败
 
-### 复查结果
+### 问题
+`app/main.py` 含大量中文注释，Cursor StrReplace 工具因编码匹配问题持续报 `old_string not found`。
 
-**自检答案**: Yes（代码基于官方文档和示例，无假设 API）
+### 尝试
+1. 直接 StrReplace → 失败
+2. PowerShell `Get-Content | cat -A` → 中文乱码无法定位
+3. `python -c` 内联脚本 → 三引号与 PowerShell 引号冲突，SyntaxError
 
-#### 复查详情：
+### 解决
+将修改逻辑写为独立 Python 脚本（`fix_main.py`、`fix_audit_logger.py`），通过 `python fix_xxx.py` 执行，完全绕过 Shell 引号问题。
 
-1. **import 语句**: ✅ 从官方 PyPI 和源码确认
-   ```python
-   from llamafirewall import LlamaFirewall, UserMessage, Role, ScannerType, ScanDecision
-   ```
-
-2. **初始化**: ✅ 与官方示例一致
-   ```python
-   lf = LlamaFirewall(scanners={
-       Role.USER: [ScannerType.PROMPT_GUARD],
-       Role.SYSTEM: [ScannerType.PROMPT_GUARD],
-   })
-   ```
-
-3. **scan 方法**: ✅ 与官方示例一致
-   ```python
-   result = lf.scan(UserMessage(content="..."))
-   ```
-
-4. **Scanner 类型**: ✅ 从官方源码确认
-   - PROMPT_GUARD
-   - CODE_SHIELD
-   - AGENT_ALIGNMENT
-   - PII_DETECTION
-   - HIDDEN_ASCII
-   - REGEX
-
-5. **官方文档链接**:
-   - PyPI: https://pypi.org/project/llamafirewall/
-   - GitHub: https://github.com/meta-llama/PurpleLlama/tree/main/LlamaFirewall
-   - 文档: https://meta-llama.github.io/PurpleLlama/LlamaFirewall/
-   - 论文: https://arxiv.org/pdf/2505.03574.pdf
-
-### 当前处理
-- 代码已基于官方文档和示例修正
-- 待用户本地验证
+### 状态
+✅ 已解决
 
 ---
 
-## 2026-03-16 模型信息汇总
+## 2026-03-18 routes/__init__.py 空字节
 
-### 官方模型列表（从源码确认）
+### 问题
+PowerShell `echo "" > __init__.py` 写入了 BOM/null 字节，导致 Python 报 `SyntaxError: source code string cannot contain null bytes`。
 
-| Scanner | 模型名称 | 来源 | 是否必需 |
-|---------|----------|------|----------|
-| **Prompt Guard** | `meta-llama/Llama-Prompt-Guard-2-86M` | HuggingFace | ✅ 必需 |
-| **Code Shield** | `codeshield` (Python 包) | PyPI | ✅ 必需 |
-| **Alignment Check** | `meta-llama/Llama-4-Maverick-17B-128E-Instruct-FP8` | Together.ai API | ❌ 实验性 |
-| **PII Detection** | - | - | ❌ 可选 |
-| **Hidden ASCII** | - | 本地检测 | ❌ 可选 |
-| **Regex** | - | 自定义规则 | ❌ 可选 |
-
-### 依赖包
-```
-llamafirewall==1.0.3
-codeshield>=1.0.1
-huggingface-hub>=0.30.2
-numpy>=2.1.1
-openai>=1.76.0
-pydantic>=2.11.3
-torch>=2.4.1
-transformers>=4.51.3
-typer>=0.15.2
+### 解决
+```python
+python -c "open(r'app/routes/__init__.py', 'w', encoding='utf-8').write('')"
 ```
 
 ### 状态
-✅ 已记录
+✅ 已解决
 
 ---
 
-## 2026-03-16 文档更新完成
+## 2026-03-18 auth.py 变量定义顺序错误
 
-已更新以下文档反映最新官方信息：
-1. README.md - 添加 LlamaFirewall 组件详情、模型信息、官方链接
-2. architecture.md - 添加 Scanner 详细说明、模块依赖
-3. logs.md - 记录更新过程
-4. module_logs.md - 更新版本和 API 状态
+### 问题
+`get_current_user()` 函数被插入到 `JWT_SECRET` 变量定义之前，导致运行时 `NameError: name 'JWT_SECRET' is not defined`。
+
+### 解决
+重写 `auth.py`，确保顺序：
+1. JWT 常量定义（`JWT_SECRET`、`JWT_ALGORITHM`）
+2. 密码工具函数（`hash_password`、`verify_password`）
+3. `get_current_user()` 依赖函数
+4. `router` 及路由处理函数
 
 ### 状态
-✅ 完成
+✅ 已解决
+
+---
+
+## 2026-03-18 main.py 中残留 audit_logger 引用
+
+### 问题
+迁移过程中删除了全局 `audit_logger` 变量，但 `health_check`、`chat` 端点内仍有多处引用，导致服务启动后所有请求返回 `500 NameError`。
+
+### 解决
+使用 `fix_audit_logger.py` 脚本扫描并删除所有 `audit_logger.*` 调用块，`health_check` 改为用 `firewall_manager` 判断数据库状态。
+
+### 状态
+✅ 已解决
+
+---
+
+## 2026-03-16 LlamaFirewall API 假设错误
+
+### 问题
+最初代码基于假设的 API，`pip install llamafirewall` 后发现实际 API 完全不同。
+
+### 对比
+| 项目 | 实际 API | 假设（错误）|
+|------|----------|-----------|
+| 包版本 | 1.0.3 | 2026.1.0 ❌ |
+| ScannerType | PROMPT_GUARD, CODE_SHIELD | LLAMA_GUARD ❌ |
+| Decision | ScanDecision.BLOCK/ALLOW | Decision.DENY ❌ |
+| 初始化 | `LlamaFirewall(scanners={Role:[...]})` | `LlamaFirewall(mode=..., threshold=...)` ❌ |
+| 扫描方法 | `scan(input=Message, trace=Trace)` | `scan(messages=..., scanner_type=...)` ❌ |
+
+### 解决
+完全重写 `app/firewall.py`，基于官方 PyPI 和 GitHub 示例验证 API。
+
+### 状态
+✅ 已解决
+
+---
+
+## 官方模型信息
+
+| Scanner | 模型 | 必需 |
+|---------|------|------|
+| Prompt Guard | `meta-llama/Llama-Prompt-Guard-2-86M` | ✅ |
+| CodeShield | `codeshield` 包（内置）| ✅ |
+| Alignment Check | `Llama-4-Maverick`（Together.ai）| ❌ 实验性 |

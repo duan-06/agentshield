@@ -1,146 +1,167 @@
-# Llama Shield 架构文档
+# Llama Shield 系统架构
 
-## 项目概述
+## 概述
 
-Llama Shield 是基于 Meta PurpleLlama/LlamaFirewall 的 LLM 安全防护系统，提供多层防护来防御越狱攻击和恶意内容。
+Llama Shield 是基于 Meta PurpleLlama/LlamaFirewall 的 LLM 安全防护系统，同时也是 AgentShield 项目的统一后端，提供用户认证、测试评估、数据统计和 AI 护栏防护。
 
-## 系统架构
+## 系统架构图
 
 ```
-客户端 / API Gateway
-↓ (HTTPS + 限流)
-FastAPI 服务层（入口 + JWT认证 + 限流）
-↓
-LlamaFirewall 中间件（核心防护引擎）
-├── Prompt Guard (meta-llama/Llama-Prompt-Guard-2-86M)
-│   └── 用途: 检测越狱提示词和注入攻击
-├── CodeShield (codeshield 包)
-│   └── 用途: 检测代码安全漏洞 (CWE)
-└── Alignment Check (实验性, Llama-4 + Together.ai API)
-    └── 用途: 检测多轮对话中的目标劫持
-↓（仅当 decision == "ALLOW" 时才继续）
-vLLM 推理服务（Meta-Llama-3.1-70B-Instruct 或 3.2 系列）
-↓
-最终响应 + 完整审计日志入库
+前端 (React + TypeScript, 端口 5173)
+        ↓ HTTP/HTTPS
+FastAPI 服务层（端口 8000）
+├── 中间件层
+│   ├── CORS 中间件
+│   ├── 请求日志中间件（structlog）
+│   └── JWT 认证依赖（get_current_user）
+│
+├── 业务路由层
+│   ├── /api/auth/*     - 用户注册 / 登录
+│   ├── /api/tests/*    - 测试类别 / 护栏评估 / 历史 / 统计
+│   ├── /api/stats/*    - 图表数据 / 概览
+│   └── /api/v1/chat    - 完整对话接口
+│
+├── LlamaFirewall 护栏引擎
+│   ├── Prompt Guard（meta-llama/Llama-Prompt-Guard-2-86M）
+│   │   └── 检测用户输入中的越狱/注入攻击
+│   ├── CodeShield（codeshield 包）
+│   │   └── 检测模型输出中的 CWE 代码漏洞
+│   └── Alignment Check（实验性，默认关闭）
+│       └── 检测多轮对话中的目标劫持
+│
+├── 推理引擎（/api/v1/chat 使用）
+│   ├── MiniMax API（优先，云端）
+│   ├── vLLM（本地 GPU）
+│   └── HuggingFace Transformers（回退）
+│
+└── 数据层
+    └── MySQL（agentshield 数据库）
+        ├── users
+        ├── risk_categories
+        ├── test_cases
+        ├── test_results（含护栏扫描字段）
+        └── audit_logs
 ```
 
 ## LlamaFirewall 组件详情
 
-### 1. PromptGuardScanner
+### Prompt Guard
 - **ScannerType**: `ScannerType.PROMPT_GUARD`
-- **模型**: `meta-llama/Llama-Prompt-Guard-2-86M` (86M 参数)
-- **用途**: 检测用户输入中的越狱提示词和注入攻击
-- **参数**:
-  - `block_threshold`: 默认 0.9
-- **Role 映射**: Role.USER, Role.SYSTEM
+- **模型**: `meta-llama/Llama-Prompt-Guard-2-86M`（86M 参数，本地加载）
+- **Role 映射**: `Role.USER`
+- **检测目标**: 越狱提示词、Prompt 注入攻击
+- **触发时机**: 每次用户输入前扫描
 
-### 2. CodeShieldScanner
+### CodeShield
 - **ScannerType**: `ScannerType.CODE_SHIELD`
-- **模型**: 通过 `codeshield` Python 包
-- **用途**: 检测生成代码中的 CWE 安全漏洞
-- **参数**:
-  - 无需额外配置
-- **Role 映射**: Role.ASSISTANT, Role.TOOL
+- **来源**: `codeshield` Python 包（内置规则）
+- **Role 映射**: `Role.ASSISTANT`
+- **检测目标**: CWE 代码安全漏洞
+- **触发时机**: 模型输出后扫描
 
-### 3. AlignmentCheckScanner（实验性）
+### Alignment Check（实验性）
 - **ScannerType**: `ScannerType.AGENT_ALIGNMENT`
 - **模型**: `meta-llama/Llama-4-Maverick-17B-128E-Instruct-FP8`
-- **API**: `https://api.together.xyz/v1`
-- **用途**: 检测多轮对话中的目标劫持和 agent 对齐问题
-- **环境变量**: `TOGETHER_API_KEY`
-- **Role 映射**: Role.USER, Role.ASSISTANT
+- **API**: Together.ai（需要 `TOGETHER_API_KEY`）
+- **检测目标**: 多轮对话目标劫持、Agent 对齐问题
+- **状态**: 默认关闭（`LLAMAFIREWALL_ENABLE_ALIGNMENT_CHECK=false`）
 
-### 4. 其他 Scanner（可选）
-- **PII_DETECTION**: PII 信息检测
-- **HIDDEN_ASCII**: 隐藏字符检测
-- **REGEX**: 自定义正则匹配
+### StackOne Defender
+- **实现**: `app/stackone_defender.js`（Node.js 脚本）
+- **检测目标**: 工具输出中的间接 Prompt 注入
+- **特点**: 轻量级（22MB，CPU-only，<10ms 延迟）
+- **状态**: 可选，通过 `scan_tool_output_with_stackone()` 调用
 
 ## 模块依赖关系
 
-### app/main.py
-- 依赖: app.firewall, app.database, app.monitoring, app.models
-- 功能: FastAPI 应用入口，提供 /chat, /health, /stats 接口
+```
+app/main.py
+├── app/firewall.py      ← llamafirewall 包
+├── app/db.py            ← SQLAlchemy + aiomysql
+├── app/db_models.py     ← SQLAlchemy ORM
+├── app/monitoring.py    ← prometheus_client
+├── app/models.py        ← pydantic
+└── app/routes/
+    ├── auth.py          ← db.py + db_models.py
+    ├── tests.py         ← db.py + db_models.py + firewall.py
+    └── stats.py         ← db.py + db_models.py
+```
 
-### app/firewall.py
-- 依赖: llamafirewall 包
-- 功能: LlamaFirewall 核心防护引擎封装
-- 使用官方 API:
-  - `LlamaFirewall(scanners={Role: [ScannerType]})`
-  - `firewall.scan(input=Message, trace=Trace)`
-
-### app/database.py
-- 依赖: sqlalchemy, asyncpg
-- 功能: PostgreSQL 审计日志存储
-
-### app/monitoring.py
-- 依赖: prometheus_client
-- 功能: Prometheus 指标收集
-
-### app/models.py
-- 依赖: pydantic
-- 功能: 数据模型定义
-
-## 数据流向
-
-1. **请求进入**: FastAPI 接收请求 → JWT 认证
-2. **输入扫描**: Prompt Guard → Alignment Check → 决策
-3. **推理**: vLLM 生成响应
-4. **输出扫描**: CodeShield → 决策
-5. **审计**: PostgreSQL 记录完整日志
-
-## API 接口定义
-
-### POST /api/v1/chat
-- 输入: ChatRequest (messages, temperature, max_tokens, stream)
-- 输出: ChatResponse (id, choices, usage)
-- 错误: HTTP 403 (blocked), HTTP 401 (unauthorized)
-
-### GET /health
-- 输出: HealthResponse (status, version, firewall_status, database_status, uptime)
-
-### GET /api/v1/stats
-- 输出: 统计信息 (total_requests, blocked_requests, block_rate, etc.)
-
-### GET /metrics
-- 输出: Prometheus 指标
-
-## 关键配置说明
-
-| 环境变量 | 说明 | 默认值 |
-|---------|------|--------|
-| LLAMAFIREWALL_MODE | 防护模式 | strict |
-| LLAMAFIREWALL_BLOCK_THRESHOLD | 阻断阈值 | 0.8 |
-| VLLM_MODEL | 推理模型 | meta-llama/Llama-3.1-70B-Instruct |
-| POSTGRES_HOST | 数据库地址 | localhost |
-| REDIS_HOST | Redis 地址 | localhost |
-| HF_TOKEN | HuggingFace Token | - |
-| TOGETHER_API_KEY | Together.ai API Key | - |
-
-## 文件结构
+## 数据流：护栏评估（/api/tests/evaluate）
 
 ```
-llama-shield/
-├── .env.example          # 环境变量示例
-├── requirements.txt      # Python 依赖
-├── Dockerfile           # 生产镜像
-├── docker-compose.yml   # 开发环境
-├── README.md            # 项目文档
-├── app/
-│   ├── __init__.py
-│   ├── main.py          # FastAPI 应用
-│   ├── firewall.py       # LlamaFirewall 管理器
-│   ├── database.py       # PostgreSQL 审计
-│   ├── monitoring.py     # Prometheus 监控
-│   └── models.py         # 数据模型
-├── config/
-│   └── policy.yaml       # 安全策略配置
-├── k8s/
-│   ├── deployment.yaml   # K8s Deployment
-│   ├── service.yaml     # K8s Service
-│   └── hpa.yaml        # HPA 配置
-└── tests/
-    └── test_jailbreak.py # CyberSecEval 测试
+1. 前端 POST /api/tests/evaluate
+   └── body: { categoryId, input }
+
+2. JWT 认证
+   └── get_current_user() → user_id
+
+3. 检查风险类别是否存在
+   └── SELECT FROM risk_categories WHERE id = categoryId
+
+4. LlamaFirewall 扫描
+   └── firewall.scan_input(messages=[{role:user, content:input}])
+       ├── Prompt Guard 推理（本地模型）
+       └── 返回 FirewallScanResult
+           ├── is_blocked: bool
+           ├── score: float
+           ├── blocked_by: str | None
+           └── blocked_reason: str | None
+
+5. 计算风险等级
+   └── score → low / medium / high / critical
+
+6. 写入数据库
+   └── INSERT INTO test_results (...)
+
+7. 返回响应
+   └── { success, data: { id, riskLevel, riskScore, isBlocked, ... } }
 ```
+
+## 数据流：完整对话（/api/v1/chat）
+
+```
+1. POST /api/v1/chat（需要 JWT）
+2. LlamaFirewall 输入扫描（Prompt Guard）
+   ├── BLOCK → 403 Forbidden
+   └── ALLOW → 继续
+3. LLM 推理（MiniMax / vLLM / Transformers）
+4. LlamaFirewall 输出扫描（CodeShield）
+   ├── BLOCK → 403 Forbidden
+   └── ALLOW → 继续
+5. 返回 ChatResponse
+```
+
+## API 接口汇总
+
+| 方法 | 路径 | 认证 | 说明 |
+|------|------|------|------|
+| GET | `/health` | 否 | 健康检查 |
+| POST | `/api/auth/register` | 否 | 用户注册 |
+| POST | `/api/auth/login` | 否 | 用户登录 |
+| GET | `/api/tests/categories` | 否 | 风险类别 |
+| POST | `/api/tests/evaluate` | 是 | ★ 护栏评估 |
+| GET | `/api/tests/history` | 是 | 历史记录 |
+| GET | `/api/tests/stats` | 是 | 风险统计 |
+| GET | `/api/stats/charts` | 是 | 图表数据 |
+| GET | `/api/stats/overview` | 是 | 总览数据 |
+| POST | `/api/v1/chat` | 是 | 完整对话 |
+| GET | `/api/v1/stats` | 否 | 护栏统计 |
+| GET | `/docs` | 否 | Swagger 文档 |
+
+## 关键配置
+
+| 环境变量 | 默认值 | 说明 |
+|---------|--------|------|
+| `MYSQL_HOST` | `localhost` | MySQL 主机 |
+| `MYSQL_DB` | `agentshield` | 数据库名 |
+| `JWT_SECRET` | - | JWT 签名密钥 |
+| `LLAMAFIREWALL_MODE` | `strict` | 护栏模式 |
+| `LLAMAFIREWALL_BLOCK_THRESHOLD` | `0.8` | 阻断阈值 |
+| `HF_TOKEN` | - | HuggingFace Token |
+| `USE_MINIMAX_API` | `false` | 启用 MiniMax 推理 |
+| `MINIMAX_API_KEY` | - | MiniMax API Key |
+| `TOGETHER_API_KEY` | - | Together.ai（Alignment Check）|
 
 ## 官方资源
 
