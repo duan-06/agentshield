@@ -38,8 +38,13 @@ async function main() {
   }
 
   try {
-    // 调用 StackOne Defender 检测
-    const result = defense.defendToolResult(toolOutput, toolName);
+    // 预热模型（首次调用需要）
+    if (!defense.isTier2Ready()) {
+      await defense.warmupTier2();
+    }
+
+    // 调用 StackOne Defender 检测（异步）
+    const result = await defense.defendToolResult(toolOutput, toolName);
 
     // 返回结果
     console.log(JSON.stringify({
