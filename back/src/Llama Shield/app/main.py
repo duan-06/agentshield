@@ -24,9 +24,12 @@ from jose import JWTError, jwt
 import structlog
 
 from app.firewall import LlamaFirewallManager
-from app.database import AuditLogger, init_db
+from app.db import init_db, close_db
 from app.monitoring import MetricsCollector
 from app.models import ChatRequest, ChatResponse, HealthResponse
+from app.routes import auth as auth_router
+from app.routes import tests as tests_router
+from app.routes import stats as stats_router
 
 # vLLM 推理引擎配置
 VLLM_MODEL_PATH = os.getenv("VLLM_MODEL_PATH", "D:/计算机设计大赛/models/qwen/Qwen2___5-7B-Instruct")
@@ -54,7 +57,6 @@ logger = structlog.get_logger(__name__)
 
 # 全局变量
 firewall_manager: Optional[LlamaFirewallManager] = None
-audit_logger: Optional[AuditLogger] = None
 metrics: Optional[MetricsCollector] = None
 
 # 推理引擎实例
@@ -235,14 +237,14 @@ async def rate_limit_check(request: Request):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """应用生命周期管理"""
-    global firewall_manager, audit_logger, metrics
+    global firewall_manager, metrics
 
     startup_time = time.time()
 
-    # 初始化数据库
-    logger.info("Initializing database...")
-    await init_db()
-    audit_logger = AuditLogger()
+    # 初始化 MySQL 数据库
+    logger.info("Initializing MySQL database...")
+    from app.db import init_db as mysql_init_db, close_db
+    await mysql_init_db()
 
     # 初始化 LlamaFirewall
     logger.info("Initializing LlamaFirewall...")
@@ -265,6 +267,7 @@ async def lifespan(app: FastAPI):
     logger.info("Shutting down application...")
     if firewall_manager:
         await firewall_manager.cleanup()
+    await close_db()
     logger.info("Application shutdown complete")
 
 
@@ -285,6 +288,14 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# ==================== 注册业务路由 ====================
+from app.routes import auth as auth_router
+from app.routes import tests as tests_router
+from app.routes import stats as stats_router
+app.include_router(auth_router.router)
+app.include_router(tests_router.router)
+app.include_router(stats_router.router)
 
 
 # ==================== 中间件 ====================
@@ -320,7 +331,7 @@ async def health_check():
         status="healthy",
         version="1.0.0",
         firewall_status="active" if firewall_manager else "inactive",
-        database_status="connected" if audit_logger else "disconnected",
+        database_status="connected" if firewall_manager else "disconnected",
         uptime=time.time()
     )
 
@@ -367,15 +378,6 @@ async def chat(
                 request_id=request_id,
                 blocked_by=input_scan_result.blocked_by,
                 reason=input_scan_result.blocked_reason
-            )
-
-            # 记录阻断日志
-            await audit_logger.log_blocked_request(
-                request_id=request_id,
-                messages=messages_dict,
-                blocked_by=input_scan_result.blocked_by,
-                reason=input_scan_result.blocked_reason,
-                scan_result=input_scan_result
             )
 
             # 更新指标
@@ -428,15 +430,6 @@ async def chat(
                 reason=output_scan_result.blocked_reason
             )
 
-            await audit_logger.log_blocked_request(
-                request_id=request_id,
-                messages=messages_dict,
-                response=response_content,
-                blocked_by=output_scan_result.blocked_by,
-                reason=output_scan_result.blocked_reason,
-                scan_result=output_scan_result
-            )
-
             metrics.increment_blocked_requests(
                 blocked_by=output_scan_result.blocked_by
             )
@@ -453,16 +446,6 @@ async def chat(
 
         # ==================== 步骤 4: 成功响应 ====================
         duration = time.time() - start_time
-
-        # 记录成功请求
-        await audit_logger.log_successful_request(
-            request_id=request_id,
-            messages=messages_dict,
-            response=response_content,
-            input_scan=input_scan_result,
-            output_scan=output_scan_result,
-            duration=duration
-        )
 
         # 更新指标
         metrics.increment_successful_requests(duration=duration)
