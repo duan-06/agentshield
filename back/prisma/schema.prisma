@@ -19,6 +19,7 @@ model User {
   updatedAt DateTime @updatedAt
 
   testResults TestResult[]
+  datasetTestResults DatasetTestResult[]
 
   @@map("users")
 }
@@ -31,6 +32,7 @@ model RiskCategory {
 
   testCases  TestCase[]
   testResults TestResult[]
+  datasetTestResults DatasetTestResult[]
 
   @@map("risk_categories")
 }
@@ -60,7 +62,30 @@ model TestResult {
   output      String  @db.Text
   riskLevel   String  // "low", "medium", "high", "critical"
   riskScore   Float   @default(0)
+  testType    String  @default("single")  // "single" or "dataset"
   createdAt   DateTime @default(now())
 
   @@map("test_results")
+}
+
+model DatasetTestResult {
+  id                    Int     @id @default(autoincrement())
+  userId                Int
+  user                  User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  categoryId            Int
+  category              RiskCategory @relation(fields: [categoryId], references: [id])
+  fileName              String
+  fileSize              Int
+  total                 Int
+  blocked               Int
+  passed                Int
+  blockRate             Float
+  avgRiskScore          Float
+  riskDistribution      String  @db.Text  // JSON string
+  categoryDistribution  String  @db.Text  // JSON string
+  riskScoreDistribution String  @db.Text  // JSON string
+  details               String  @db.LongText
+  createdAt             DateTime @default(now())
+
+  @@map("dataset_test_results")
 }

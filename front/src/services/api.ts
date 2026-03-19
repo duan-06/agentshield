@@ -26,13 +26,24 @@ export const authAPI = {
 
 export const testsAPI = {
   getCategories: () => apiClient.get('/tests/categories'),
-  
+
   evaluate: (categoryId: number, input: string, evaluationCriteria?: string) =>
     apiClient.post('/tests/evaluate', { categoryId, input, evaluationCriteria }),
-  
+
   getHistory: () => apiClient.get('/tests/history'),
-  
+
   getStats: () => apiClient.get('/tests/stats'),
+
+  getTestMode: () => apiClient.get('/tests/mode'),
+
+  saveDatasetTest: (categoryId: number, fileName: string, fileSize: number, stats: any) =>
+    apiClient.post('/tests/dataset-test', { categoryId, fileName, fileSize, stats }),
+
+  getTestResult: (id: number) =>
+    apiClient.get(`/tests/result/${id}`),
+
+  getDatasetResult: (id: number) =>
+    apiClient.get(`/tests/dataset-result/${id}`),
 };
 
 export const statsAPI = {
