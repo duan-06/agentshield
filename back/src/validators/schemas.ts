@@ -33,5 +33,5 @@ export const loginSchema = Joi.object({
 export const testEvaluateSchema = Joi.object({
   categoryId: Joi.number().required(),
   input: Joi.string().required(),
-  evaluationCriteria: Joi.string().optional(),
+  evaluationCriteria: Joi.string().allow('').optional(),
 });
