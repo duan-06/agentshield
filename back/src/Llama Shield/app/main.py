@@ -27,9 +27,9 @@ from app.firewall import LlamaFirewallManager
 from app.db import init_db, close_db
 from app.monitoring import MetricsCollector
 from app.models import ChatRequest, ChatResponse, HealthResponse
-from app.routes import auth as auth_router
-from app.routes import tests as tests_router
-from app.routes import stats as stats_router
+# from app.routes import auth as auth_router
+# from app.routes import tests as tests_router
+# from app.routes import stats as stats_router
 
 # vLLM 推理引擎配置
 VLLM_MODEL_PATH = os.getenv("VLLM_MODEL_PATH", "D:/计算机设计大赛/models/qwen/Qwen2___5-7B-Instruct")
@@ -290,12 +290,12 @@ app.add_middleware(
 )
 
 # ==================== 注册业务路由 ====================
-from app.routes import auth as auth_router
-from app.routes import tests as tests_router
-from app.routes import stats as stats_router
-app.include_router(auth_router.router)
-app.include_router(tests_router.router)
-app.include_router(stats_router.router)
+# from app.routes import auth as auth_router
+# from app.routes import tests as tests_router
+# from app.routes import stats as stats_router
+# app.include_router(auth_router.router)
+# app.include_router(tests_router.router)
+# app.include_router(stats_router.router)
 
 
 # ==================== 中间件 ====================
@@ -365,6 +365,47 @@ async def chat(
         # 转换为字典格式
         messages_dict = [msg.model_dump() for msg in request.messages]
 
+        # ==================== 步骤 1.1: 扫描工具返回结果 ====================
+        # 在大模型处理之前，扫描工具返回结果中的间接注入
+        tool_messages = [msg for msg in messages_dict if msg.get("role") == "tool"]
+        if tool_messages:
+            logger.info(f"Found {len(tool_messages)} tool messages, scanning for indirect injection", request_id=request_id)
+
+            for idx, tool_msg in enumerate(tool_messages):
+                tool_content = tool_msg.get("content", "")
+                tool_name = tool_msg.get("name", "default")
+
+                # 调用 StackOne Defender 扫描工具返回
+                tool_scan_result = await firewall_manager.scan_tool_output_with_stackone(
+                    tool_output=tool_content,
+                    tool_name=tool_name
+                )
+
+                if tool_scan_result.is_blocked:
+                    logger.warning(
+                        "Tool output blocked by StackOne Defender",
+                        request_id=request_id,
+                        tool_index=idx,
+                        tool_name=tool_name,
+                        blocked_by=tool_scan_result.blocked_by,
+                        reason=tool_scan_result.blocked_reason
+                    )
+
+                    metrics.increment_blocked_requests(
+                        blocked_by="StackOneDefender"
+                    )
+
+                    raise HTTPException(
+                        status_code=status.HTTP_403_FORBIDDEN,
+                        detail={
+                            "error": "Tool output blocked by security policy",
+                            "blocked_reason": tool_scan_result.blocked_reason,
+                            "blocked_by": "StackOneDefender",
+                            "request_id": request_id
+                        }
+                    )
+
+        # ==================== 步骤 1.2: 常规输入扫描 ====================
         # 使用 LlamaFirewall 扫描用户输入
         input_scan_result = await firewall_manager.scan_input(
             messages=messages_dict,
@@ -415,34 +456,43 @@ async def chat(
             )
 
         # ==================== 步骤 3: 输出扫描 ====================
-        logger.info("Starting output scan", request_id=request_id)
+        enable_output_scan = os.getenv("LLAMAFIREWALL_ENABLE_OUTPUT_SCAN", "true").lower() == "true"
 
-        output_scan_result = await firewall_manager.scan_output(
-            content=response_content,
-            request_id=request_id
-        )
+        if enable_output_scan:
+            logger.info("Starting output scan", request_id=request_id)
 
-        if output_scan_result.is_blocked:
-            logger.warning(
-                "Output blocked by firewall",
-                request_id=request_id,
-                blocked_by=output_scan_result.blocked_by,
-                reason=output_scan_result.blocked_reason
-            )
+            try:
+                output_scan_result = await firewall_manager.scan_output(
+                    content=response_content,
+                    request_id=request_id
+                )
 
-            metrics.increment_blocked_requests(
-                blocked_by=output_scan_result.blocked_by
-            )
+                if output_scan_result.is_blocked:
+                    logger.warning(
+                        "Output blocked by firewall",
+                        request_id=request_id,
+                        blocked_by=output_scan_result.blocked_by,
+                        reason=output_scan_result.blocked_reason
+                    )
 
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail={
-                    "error": "Response blocked by security policy",
-                    "blocked_reason": output_scan_result.blocked_reason,
-                    "blocked_by": output_scan_result.blocked_by,
-                    "request_id": request_id
-                }
-            )
+                    metrics.increment_blocked_requests(
+                        blocked_by=output_scan_result.blocked_by
+                    )
+
+                    raise HTTPException(
+                        status_code=status.HTTP_403_FORBIDDEN,
+                        detail={
+                            "error": "Response blocked by security policy",
+                            "blocked_reason": output_scan_result.blocked_reason,
+                            "blocked_by": output_scan_result.blocked_by,
+                            "request_id": request_id
+                        }
+                    )
+            except HTTPException:
+                raise
+            except Exception as e:
+                logger.error(f"Output scan error: {e}")
+                # 输出扫描出错时放行（保守策略）
 
         # ==================== 步骤 4: 成功响应 ====================
         duration = time.time() - start_time

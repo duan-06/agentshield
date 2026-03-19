@@ -12,7 +12,9 @@
     "prisma:seed": "tsx prisma/seed.ts"
   },
   "dependencies": {
+    "@huggingface/transformers": "^3.8.1",
     "@prisma/client": "^5.7.1",
+    "@stackone/defender": "^0.4.5",
     "axios": "^1.13.6",
     "bcryptjs": "^2.4.3",
     "cors": "^2.8.5",

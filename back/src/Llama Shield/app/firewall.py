@@ -73,7 +73,7 @@ from llamafirewall import (
 
 
 # StackOne Defender 配置
-STACKONE_SCRIPT_PATH = os.path.join(os.path.dirname(__file__), "stackone_defender.js")
+STACKONE_SCRIPT_PATH = os.path.join(os.path.dirname(__file__), "stackone_defender.cjs")
 
 # Alignment Check Few-shot Prompt 模板
 ALIGNMENT_CHECK_PROMPT_TEMPLATE = """你是一个严格的对齐审计员。请分析以下 Agent 执行轨迹，判断是否偏离用户原始意图。
@@ -242,8 +242,9 @@ class LlamaFirewallManager:
 
         流程：
         1. 构建 Message 对象和 trace
-        2. 扫描最后一条用户消息
-        3. 返回阻断决策
+        2. 扫描最后一条用户消息 (Prompt Guard)
+        3. 执行 Alignment Check (多轮目标劫持检测)
+        4. 返回阻断决策
 
         Args:
             messages: 消息列表 [{"role": "user", "content": "..."}, ...]
@@ -279,7 +280,7 @@ class LlamaFirewallManager:
         # 创建用户消息
         user_message = UserMessage(content=last_user_message.get("content", ""))
 
-        # 执行扫描（在独立线程中运行，避免事件循环冲突）
+        # ==================== 步骤 1: Prompt Guard 扫描 ====================
         try:
             result = await asyncio.to_thread(
                 self.firewall.scan, input=user_message, trace=trace
@@ -301,7 +302,7 @@ class LlamaFirewallManager:
         if is_blocked:
             blocked_by = self._determine_blocked_by(result.reason)
             logger.warning(
-                "Input blocked by firewall",
+                "Input blocked by Prompt Guard",
                 request_id=request_id,
                 blocked_by=blocked_by,
                 reason=result.reason,
@@ -315,6 +316,50 @@ class LlamaFirewallManager:
                 blocked_reason=self._sanitize_reason(result.reason),
                 score=result.score
             )
+
+        # ==================== 步骤 2: Alignment Check 扫描 ====================
+        # 仅当启用 Alignment Check 且有多轮对话时执行
+        if self.config["enable_alignment_check"] and len(messages) > 1:
+            # 提取原始目标（第一条用户消息）
+            original_goal = ""
+            for msg in messages:
+                if msg.get("role") == "user":
+                    original_goal = msg.get("content", "")
+                    break
+
+            # 构建对话轨迹（排除最后一条用户消息）
+            conversation_trace = messages[:-1]
+
+            logger.info(
+                "Running Alignment Check",
+                request_id=request_id,
+                original_goal=original_goal[:50] + "...",
+                trace_length=len(conversation_trace)
+            )
+
+            # 执行 Alignment Check
+            alignment_result = await self.alignment_check_with_minimax(
+                original_goal=original_goal,
+                conversation_trace=conversation_trace
+            )
+
+            # 如果 Alignment Check 阻断
+            if alignment_result.is_blocked:
+                logger.warning(
+                    "Input blocked by Alignment Check",
+                    request_id=request_id,
+                    reason=alignment_result.blocked_reason,
+                    score=alignment_result.score
+                )
+
+                return FirewallScanResult(
+                    is_blocked=True,
+                    decision=ScanDecision.BLOCK.value,
+                    blocked_by="AlignmentCheck",
+                    blocked_reason=alignment_result.blocked_reason,
+                    score=alignment_result.score,
+                    metadata=alignment_result.metadata
+                )
 
         return FirewallScanResult(
             is_blocked=False,
@@ -351,19 +396,19 @@ class LlamaFirewallManager:
         # 创建 Assistant 消息
         assistant_message = AssistantMessage(content=content)
 
+        # ==================== CodeShield 扫描 ====================
         # 执行扫描（在独立线程中运行，避免事件循环冲突）
         try:
             result = await asyncio.to_thread(
                 self.firewall.scan, input=assistant_message, trace=None
             )
         except Exception as e:
-            logger.error(f"Error scanning output: {e}")
+            logger.error(f"Error scanning output (CodeShield): {e}")
+            # CodeShield 出错时放行
             return FirewallScanResult(
-                is_blocked=True,
-                decision=ScanDecision.BLOCK.value,
-                blocked_by="Error",
-                blocked_reason=f"Scanner error: {str(e)}",
-                score=1.0
+                is_blocked=False,
+                decision=ScanDecision.ALLOW.value,
+                score=0.0
             )
 
         # 判断是否阻断
@@ -371,7 +416,7 @@ class LlamaFirewallManager:
 
         if is_blocked:
             logger.warning(
-                "Output blocked by firewall",
+                "Output blocked by CodeShield",
                 request_id=request_id,
                 blocked_by="CodeShield",
                 reason=result.reason,
@@ -380,7 +425,7 @@ class LlamaFirewallManager:
 
             return FirewallScanResult(
                 is_blocked=True,
-                decision=result.decision.value,
+                decision=ScanDecision.BLOCK.value,
                 blocked_by="CodeShield",
                 blocked_reason=self._sanitize_reason(result.reason),
                 score=result.score,
@@ -627,6 +672,60 @@ class LlamaFirewallManager:
                 decision=ScanDecision.ALLOW.value,
                 metadata={"error": str(e)}
             )
+
+    def _is_likely_tool_output(self, content: str) -> bool:
+        """
+        判断内容是否可能是工具输出
+
+        只有当内容看起来像工具输出时才调用 StackOne Defender。
+        这样可以避免对普通对话内容进行不必要的扫描。
+
+        Args:
+            content: AI 生成的内容
+
+        Returns:
+            bool: 是否可能是工具输出
+        """
+        if not content:
+            return False
+
+        content_lower = content.lower().strip()
+
+        # 工具输出常见模式
+        tool_patterns = [
+            # 文件列表
+            "total ", "drwxr-xr-x", "-rw-r--r--", "-rwxr-xr-x",
+            # 命令结果
+            "result:", "output:", "exit code", "command not found",
+            # 结构化数据
+            "json", "xml", "csv",
+            # 错误信息
+            "error:", "warning:", "exception",
+            # 表格形式
+            "|", "---", "===",
+            # 代码/脚本输出
+            "def ", "function ", "class ", "import ",
+            # 路径
+            "/bin/", "/usr/", "/home/", "c:\\",
+            # 特定工具名
+            "git:", "docker:", "npm:", "pip:", "python:",
+            # 数据库
+            "select ", "insert ", "update ", "delete ", "mysql",
+        ]
+
+        # 检查是否匹配任何工具输出模式
+        for pattern in tool_patterns:
+            if pattern in content_lower:
+                return True
+
+        # 检查是否包含多行且每行开头有固定模式（文件列表等）
+        lines = content.split('\n')
+        if len(lines) > 2:
+            # 如果多行内容且有类似表格/列表的结构
+            if any(line.startswith(('+', '-', '|', ' ', 'total', 'drwx')) for line in lines[:5] if line.strip()):
+                return True
+
+        return False
 
     def _format_trace_for_alignment(self, conversation_trace: List[Dict[str, str]]) -> str:
         """格式化对话轨迹用于 Alignment Check"""
