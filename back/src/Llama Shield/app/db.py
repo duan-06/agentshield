@@ -78,3 +78,61 @@ async def close_db():
     if _engine:
         await _engine.dispose()
         logger.info("Database connection pool closed")
+
+
+async def write_audit_log(
+    request_id: str,
+    user_id: int | None,
+    messages: list,
+    input_scan_result: dict | None,
+    response: str | None,
+    output_scan_result: dict | None,
+    decision: str,
+    blocked_by: str | None,
+    blocked_reason: str | None,
+    duration_ms: int | None,
+    extra_data: dict | None = None,
+):
+    """
+    写入审计日志到数据库
+
+    Args:
+        request_id: 请求唯一标识
+        user_id: 用户 ID（可能为空）
+        messages: 消息列表
+        input_scan_result: 输入扫描结果
+        response: 模型回复
+        output_scan_result: 输出扫描结果
+        decision: 决策（ALLOW/BLOCK）
+        blocked_by: 阻断来源
+        blocked_reason: 阻断原因
+        duration_ms: 处理耗时（毫秒）
+        extra_data: 额外数据
+    """
+    from app.db_models import AuditLog
+
+    if _session_factory is None:
+        logger.warning("Database not initialized, skipping audit log")
+        return
+
+    async with _session_factory() as session:
+        try:
+            audit_log = AuditLog(
+                request_id=request_id,
+                user_id=user_id,
+                messages=messages,
+                input_scan_result=input_scan_result,
+                response=response,
+                output_scan_result=output_scan_result,
+                decision=decision,
+                blocked_by=blocked_by,
+                blocked_reason=blocked_reason,
+                duration_ms=duration_ms,
+                extra_data=extra_data,
+            )
+            session.add(audit_log)
+            await session.commit()
+            logger.info(f"Audit log written: request_id={request_id}, decision={decision}")
+        except Exception as e:
+            logger.error(f"Failed to write audit log: {e}")
+            await session.rollback()

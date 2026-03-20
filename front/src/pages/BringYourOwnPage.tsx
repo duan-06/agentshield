@@ -281,7 +281,11 @@ export default function BringYourOwnPage() {
     try {
       const response = await testsAPI.getHistory();
       setHistory(response.data.data);
-    } catch { setError('加载历史记录失败'); }
+    } catch (err: any) {
+      console.error('加载历史记录失败:', err);
+      const errorMsg = err.response?.data?.message || err.message || '加载历史记录失败';
+      setError(errorMsg);
+    }
     finally { setHistoryLoading(false); }
   };
 

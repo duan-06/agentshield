@@ -72,14 +72,13 @@ class LlamaShieldService {
    */
   async scanInput(messages: Array<{ role: string; content: string }>): Promise<ScanResult> {
     try {
-      // 调用 chat 接口进行输入扫描
-      // 如果返回 403 说明被阻断
+      // 使用完整聊天入口进行检测（若命中策略会返回403）
       await this.client.post('/api/v1/chat', {
         messages,
-        temperature: 0.7,
+        temperature: 0,
         max_tokens: 1,
+        stream: false,
       }, {
-        // 确保使用 token
         headers: this.token ? { Authorization: `Bearer ${this.token}` } : {}
       });
 
@@ -91,13 +90,13 @@ class LlamaShieldService {
       };
     } catch (error: any) {
       if (error.response?.status === 403) {
-        const detail = error.response.data?.detail || {};
+        const detail = error.response.data?.detail || error.response.data || {};
         return {
           is_blocked: true,
           decision: 'BLOCK',
           blocked_by: detail.blocked_by || 'Unknown',
           blocked_reason: detail.blocked_reason || 'Request blocked',
-          score: 1.0,
+          score: detail.score || 1.0,
         };
       }
       // 其他错误，返回允许（保守策略）

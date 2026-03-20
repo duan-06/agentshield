@@ -10,7 +10,7 @@ import time
 import logging
 import asyncio
 from contextlib import asynccontextmanager
-from typing import Optional
+from typing import Optional, List, Dict
 
 # 加载 .env 文件
 from dotenv import load_dotenv
@@ -24,12 +24,9 @@ from jose import JWTError, jwt
 import structlog
 
 from app.firewall import LlamaFirewallManager
-from app.db import init_db, close_db
+from app.db import init_db, close_db, write_audit_log
 from app.monitoring import MetricsCollector
 from app.models import ChatRequest, ChatResponse, HealthResponse
-# from app.routes import auth as auth_router
-# from app.routes import tests as tests_router
-# from app.routes import stats as stats_router
 
 # vLLM 推理引擎配置
 VLLM_MODEL_PATH = os.getenv("VLLM_MODEL_PATH", "D:/计算机设计大赛/models/qwen/Qwen2___5-7B-Instruct")
@@ -196,6 +193,20 @@ class BlockedResponse(BaseModel):
     request_id: str
 
 
+class ScanRequest(BaseModel):
+    """输入扫描请求"""
+    messages: List[Dict[str, str]]
+
+
+class ScanResponse(BaseModel):
+    """输入扫描响应"""
+    is_blocked: bool
+    decision: str
+    blocked_by: Optional[str] = None
+    blocked_reason: Optional[str] = None
+    score: float = 0.0
+
+
 # ==================== 依赖项 ====================
 
 security = HTTPBearer(auto_error=False)
@@ -251,6 +262,12 @@ async def lifespan(app: FastAPI):
     firewall_manager = LlamaFirewallManager()
     await firewall_manager.initialize()
 
+    # 初始化 LlamaGuard（有害内容检测）
+    if os.getenv("LLAMA_GUARD_ENABLED", "false").lower() == "true":
+        logger.info("Initializing LlamaGuard...")
+        from app.firewall import initialize_llamaguard
+        await initialize_llamaguard()
+
     # 初始化监控
     logger.info("Initializing metrics...")
     metrics = MetricsCollector()
@@ -288,15 +305,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-# ==================== 注册业务路由 ====================
-# from app.routes import auth as auth_router
-# from app.routes import tests as tests_router
-# from app.routes import stats as stats_router
-# app.include_router(auth_router.router)
-# app.include_router(tests_router.router)
-# app.include_router(stats_router.router)
-
 
 # ==================== 中间件 ====================
 
@@ -357,6 +365,16 @@ async def chat(
         f"chat-{int(time.time() * 1000)}"
     )
     start_time = time.time()
+    user_id = user.get("sub") if user else None
+
+    # 审计日志数据
+    audit_messages = []
+    audit_input_scan = None
+    audit_response = None
+    audit_output_scan = None
+    audit_decision = "ALLOW"
+    audit_blocked_by = None
+    audit_blocked_reason = None
 
     try:
         # ==================== 步骤 1: 输入扫描 ====================
@@ -364,9 +382,9 @@ async def chat(
 
         # 转换为字典格式
         messages_dict = [msg.model_dump() for msg in request.messages]
+        audit_messages = messages_dict
 
         # ==================== 步骤 1.1: 扫描工具返回结果 ====================
-        # 在大模型处理之前，扫描工具返回结果中的间接注入
         tool_messages = [msg for msg in messages_dict if msg.get("role") == "tool"]
         if tool_messages:
             logger.info(f"Found {len(tool_messages)} tool messages, scanning for indirect injection", request_id=request_id)
@@ -375,7 +393,6 @@ async def chat(
                 tool_content = tool_msg.get("content", "")
                 tool_name = tool_msg.get("name", "default")
 
-                # 调用 StackOne Defender 扫描工具返回
                 tool_scan_result = await firewall_manager.scan_tool_output_with_stackone(
                     tool_output=tool_content,
                     tool_name=tool_name
@@ -391,8 +408,23 @@ async def chat(
                         reason=tool_scan_result.blocked_reason
                     )
 
-                    metrics.increment_blocked_requests(
-                        blocked_by="StackOneDefender"
+                    metrics.increment_blocked_requests(blocked_by="StackOneDefender")
+
+                    # 写入审计日志
+                    audit_decision = "BLOCK"
+                    audit_blocked_by = tool_scan_result.blocked_by
+                    audit_blocked_reason = tool_scan_result.blocked_reason
+                    await write_audit_log(
+                        request_id=request_id,
+                        user_id=user_id,
+                        messages=audit_messages,
+                        input_scan_result=audit_input_scan,
+                        response=None,
+                        output_scan_result=None,
+                        decision=audit_decision,
+                        blocked_by=audit_blocked_by,
+                        blocked_reason=audit_blocked_reason,
+                        duration_ms=int((time.time() - start_time) * 1000),
                     )
 
                     raise HTTPException(
@@ -406,13 +438,18 @@ async def chat(
                     )
 
         # ==================== 步骤 1.2: 常规输入扫描 ====================
-        # 使用 LlamaFirewall 扫描用户输入
         input_scan_result = await firewall_manager.scan_input(
             messages=messages_dict,
             request_id=request_id
         )
+        audit_input_scan = {
+            "is_blocked": input_scan_result.is_blocked,
+            "decision": input_scan_result.decision,
+            "blocked_by": input_scan_result.blocked_by,
+            "blocked_reason": input_scan_result.blocked_reason,
+            "score": input_scan_result.score,
+        }
 
-        # 如果输入被阻断
         if input_scan_result.is_blocked:
             logger.warning(
                 "Input blocked by firewall",
@@ -421,9 +458,23 @@ async def chat(
                 reason=input_scan_result.blocked_reason
             )
 
-            # 更新指标
-            metrics.increment_blocked_requests(
-                blocked_by=input_scan_result.blocked_by
+            metrics.increment_blocked_requests(blocked_by=input_scan_result.blocked_by)
+
+            # 写入审计日志
+            audit_decision = "BLOCK"
+            audit_blocked_by = input_scan_result.blocked_by
+            audit_blocked_reason = input_scan_result.blocked_reason
+            await write_audit_log(
+                request_id=request_id,
+                user_id=user_id,
+                messages=audit_messages,
+                input_scan_result=audit_input_scan,
+                response=None,
+                output_scan_result=None,
+                decision=audit_decision,
+                blocked_by=audit_blocked_by,
+                blocked_reason=audit_blocked_reason,
+                duration_ms=int((time.time() - start_time) * 1000),
             )
 
             raise HTTPException(
@@ -438,10 +489,8 @@ async def chat(
 
         # ==================== 步骤 2: vLLM 推理 ====================
         try:
-            # 构建 prompt（简单的格式，实际可以使用 ChatML 格式）
             prompt = messages_dict[-1].get("content", "") if messages_dict else ""
 
-            # 使用 vLLM 生成回复
             response_content = await generate_with_vllm(
                 prompt=prompt,
                 temperature=request.temperature,
@@ -449,11 +498,12 @@ async def chat(
             )
         except Exception as e:
             logger.error(f"LLM inference failed: {e}")
-            # 如果推理失败，返回错误消息
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                 detail={"error": "LLM service temporarily unavailable", "request_id": request_id}
             )
+
+        audit_response = response_content
 
         # ==================== 步骤 3: 输出扫描 ====================
         enable_output_scan = os.getenv("LLAMAFIREWALL_ENABLE_OUTPUT_SCAN", "true").lower() == "true"
@@ -466,6 +516,13 @@ async def chat(
                     content=response_content,
                     request_id=request_id
                 )
+                audit_output_scan = {
+                    "is_blocked": output_scan_result.is_blocked,
+                    "decision": output_scan_result.decision,
+                    "blocked_by": output_scan_result.blocked_by,
+                    "blocked_reason": output_scan_result.blocked_reason,
+                    "score": output_scan_result.score,
+                }
 
                 if output_scan_result.is_blocked:
                     logger.warning(
@@ -475,8 +532,23 @@ async def chat(
                         reason=output_scan_result.blocked_reason
                     )
 
-                    metrics.increment_blocked_requests(
-                        blocked_by=output_scan_result.blocked_by
+                    metrics.increment_blocked_requests(blocked_by=output_scan_result.blocked_by)
+
+                    # 写入审计日志
+                    audit_decision = "BLOCK"
+                    audit_blocked_by = output_scan_result.blocked_by
+                    audit_blocked_reason = output_scan_result.blocked_reason
+                    await write_audit_log(
+                        request_id=request_id,
+                        user_id=user_id,
+                        messages=audit_messages,
+                        input_scan_result=audit_input_scan,
+                        response=audit_response,
+                        output_scan_result=audit_output_scan,
+                        decision=audit_decision,
+                        blocked_by=audit_blocked_by,
+                        blocked_reason=audit_blocked_reason,
+                        duration_ms=int((time.time() - start_time) * 1000),
                     )
 
                     raise HTTPException(
@@ -492,13 +564,25 @@ async def chat(
                 raise
             except Exception as e:
                 logger.error(f"Output scan error: {e}")
-                # 输出扫描出错时放行（保守策略）
 
         # ==================== 步骤 4: 成功响应 ====================
         duration = time.time() - start_time
 
-        # 更新指标
         metrics.increment_successful_requests(duration=duration)
+
+        # 写入审计日志
+        await write_audit_log(
+            request_id=request_id,
+            user_id=user_id,
+            messages=audit_messages,
+            input_scan_result=audit_input_scan,
+            response=audit_response,
+            output_scan_result=audit_output_scan,
+            decision=audit_decision,
+            blocked_by=audit_blocked_by,
+            blocked_reason=audit_blocked_reason,
+            duration_ms=int(duration * 1000),
+        )
 
         return ChatResponse(
             id=request_id,
@@ -528,9 +612,80 @@ async def chat(
             error=str(e)
         )
         metrics.increment_errors()
+
+        # 写入错误审计日志
+        await write_audit_log(
+            request_id=request_id,
+            user_id=user_id,
+            messages=audit_messages,
+            input_scan_result=audit_input_scan,
+            response=None,
+            output_scan_result=None,
+            decision="ERROR",
+            blocked_by="InternalError",
+            blocked_reason=str(e),
+            duration_ms=int((time.time() - start_time) * 1000),
+        )
+
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail={"error": "Internal server error", "request_id": request_id}
+        )
+
+
+# ==================== 输入扫描端点 ====================
+
+@app.post("/api/v1/scan/input")
+async def scan_input(
+    http_request: Request,
+    user: dict = Depends(get_current_user)
+):
+    """
+    仅扫描用户输入，不生成响应
+
+    用于后端快速检测输入是否安全
+    """
+    request_id = http_request.headers.get(
+        "X-Request-ID",
+        f"scan-{int(time.time() * 1000)}"
+    )
+
+    try:
+        # 获取请求体
+        body = await http_request.json()
+        messages = body.get("messages", [])
+
+        # 执行输入扫描
+        result = await firewall_manager.scan_input(
+            messages=messages,
+            request_id=request_id
+        )
+
+        if result.is_blocked:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail={
+                    "is_blocked": True,
+                    "decision": result.decision,
+                    "blocked_by": result.blocked_by,
+                    "blocked_reason": result.blocked_reason,
+                    "score": result.score
+                }
+            )
+
+        return ScanResponse(
+            is_blocked=False,
+            decision=result.decision,
+            score=result.score
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Input scan error: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail={"error": str(e)}
         )
 
 
