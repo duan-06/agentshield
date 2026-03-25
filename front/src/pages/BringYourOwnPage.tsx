@@ -42,80 +42,201 @@ interface DatasetStats {
   riskDistribution: Record<string, number>;
   categoryDistribution: Record<string, number>;
   riskScoreDistribution: number[];
+  metrics?: DatasetEvalMetrics | null;
   details: string;
 }
 
-function simulateDatasetTest(fileName: string, fileSize: number): DatasetStats {
-  const seed = fileName.length * 31 + fileSize;
-  const rng = (offset = 0) => { const x = Math.sin(seed + offset) * 10000; return x - Math.floor(x); };
+interface DatasetEvalMetrics {
+  labeledTotal: number;
+  truePositive: number;
+  trueNegative: number;
+  falsePositive: number;
+  falseNegative: number;
+  accuracy: number;
+  falseNegativeRate: number;
+  falsePositiveRate: number;
+  precision: number;
+  recall: number;
+}
 
-  const total = Math.floor(rng(1) * 400) + 100;
-  const blockRateNum = 0.15 + rng(2) * 0.45;
-  const blocked = Math.round(total * blockRateNum);
-  const passed = total - blocked;
-  const avgRiskScoreNum = 0.25 + rng(3) * 0.5;
+interface DatasetPromptItem {
+  prompt: string;
+  expectedDecision?: 'block' | 'allow';
+}
 
-  const criticalCount = Math.round(blocked * (0.05 + rng(4) * 0.15));
-  const highCount     = Math.round(blocked * (0.15 + rng(5) * 0.2));
-  const mediumCount   = Math.round(blocked * (0.2  + rng(6) * 0.15));
-  const lowBlocked    = Math.max(0, blocked - criticalCount - highCount - mediumCount);
+function normalizeExpectedDecision(value: unknown): 'block' | 'allow' | undefined {
+  if (typeof value !== 'string') return undefined;
+  const normalized = value.trim().toLowerCase();
+  if (normalized === 'block' || normalized === 'allow') return normalized;
+  return undefined;
+}
 
-  const riskDistribution: Record<string, number> = {
-    critical: Math.max(0, criticalCount),
-    high:     Math.max(0, highCount),
-    medium:   Math.max(0, mediumCount),
-    low:      lowBlocked + passed,
+function parseCsvLine(line: string): string[] {
+  const cells: string[] = [];
+  let current = '';
+  let inQuotes = false;
+
+  for (let i = 0; i < line.length; i += 1) {
+    const ch = line[i];
+
+    if (ch === '"') {
+      // Handle escaped quote "" inside quoted cells.
+      if (inQuotes && line[i + 1] === '"') {
+        current += '"';
+        i += 1;
+      } else {
+        inQuotes = !inQuotes;
+      }
+      continue;
+    }
+
+    if (ch === ',' && !inQuotes) {
+      cells.push(current.trim());
+      current = '';
+      continue;
+    }
+
+    current += ch;
+  }
+
+  cells.push(current.trim());
+  return cells;
+}
+
+function parseCsvPrompts(content: string): DatasetPromptItem[] {
+  const lines = content.split(/\r?\n/).filter((line) => line.trim().length > 0);
+  if (lines.length === 0) return [];
+
+  const headerCells = parseCsvLine(lines[0]).map((h) => h.toLowerCase());
+  const promptIndex = headerCells.findIndex((h) => [
+    'prompt',
+    'input',
+    'text',
+    'content',
+    'user_input',
+    'mutated_prompt',
+    'base_prompt',
+    'test_case_prompt',
+  ].includes(h));
+  const expectedIndex = headerCells.findIndex((h) => ['expected_decision', 'expecteddecision', 'expected'].includes(h));
+
+  const startLine = promptIndex >= 0 ? 1 : 0;
+  const selectedIndex = promptIndex >= 0 ? promptIndex : 0;
+
+  return lines
+    .slice(startLine)
+    .map((line) => {
+      const cells = parseCsvLine(line);
+      const prompt = (cells[selectedIndex] || '').trim();
+      const expectedDecision = expectedIndex >= 0
+        ? normalizeExpectedDecision(cells[expectedIndex])
+        : undefined;
+      return { prompt, expectedDecision };
+    })
+    .filter((item) => item.prompt.length > 0);
+}
+
+function extractPrompt(obj: any): string {
+  if (!obj || typeof obj !== 'object') return '';
+  const candidate =
+    obj.prompt ||
+    obj.input ||
+    obj.text ||
+    obj.content ||
+    obj.user_input ||
+    obj.mutated_prompt ||
+    obj.base_prompt ||
+    obj.test_case_prompt;
+  return typeof candidate === 'string' ? candidate.trim() : '';
+}
+
+function extractDatasetItem(obj: any): DatasetPromptItem {
+  const prompt = extractPrompt(obj);
+  const expectedDecision = normalizeExpectedDecision(
+    obj?.expected_decision ?? obj?.expectedDecision ?? obj?.expected
+  );
+  return { prompt, expectedDecision };
+}
+
+function parseMetricsFromDetails(details: string): DatasetEvalMetrics | null {
+  const text = details || '';
+  const labeledTotal = Number((text.match(/标注样本：\s*(\d+)/)?.[1]) || NaN);
+  const accuracy = Number((text.match(/准确率：\s*([\d.]+)%/)?.[1]) || NaN);
+  const falseNegativeRate = Number((text.match(/漏报率（该拦截却放行）：\s*([\d.]+)%/)?.[1]) || NaN);
+  const falsePositiveRate = Number((text.match(/误报率（该放行却拦截）：\s*([\d.]+)%/)?.[1]) || NaN);
+  const confusion = text.match(/TP\/TN\/FP\/FN：\s*(\d+)\/(\d+)\/(\d+)\/(\d+)/);
+
+  if (!Number.isFinite(labeledTotal) || !Number.isFinite(accuracy) || !confusion) return null;
+
+  const truePositive = Number(confusion[1]);
+  const trueNegative = Number(confusion[2]);
+  const falsePositive = Number(confusion[3]);
+  const falseNegative = Number(confusion[4]);
+
+  return {
+    labeledTotal,
+    truePositive,
+    trueNegative,
+    falsePositive,
+    falseNegative,
+    accuracy,
+    falseNegativeRate: Number.isFinite(falseNegativeRate) ? falseNegativeRate : 0,
+    falsePositiveRate: Number.isFinite(falsePositiveRate) ? falsePositiveRate : 0,
+    precision: (truePositive + falsePositive) > 0 ? (truePositive / (truePositive + falsePositive)) * 100 : 0,
+    recall: (truePositive + falseNegative) > 0 ? (truePositive / (truePositive + falseNegative)) * 100 : 0,
   };
+}
 
-  const categories = ['提示注入', '数据泄露', '内容违规', '身份伪造', '恶意代码', '偏见歧视'];
-  const categoryDistribution: Record<string, number> = {};
-  categories.forEach((cat, i) => { categoryDistribution[cat] = Math.floor(rng(10 + i) * (total / 3)) + 1; });
+async function parseDatasetFile(file: File): Promise<DatasetPromptItem[]> {
+  const content = await file.text();
+  const name = file.name.toLowerCase();
 
-  const riskScoreDistribution = Array.from({ length: 10 }, (_, i) => {
-    const base = total / 10;
-    const bias = i < 5 ? -rng(20 + i) * base * 0.5 : rng(20 + i) * base * 0.8;
-    return Math.max(1, Math.round(base + bias));
-  });
+  if (name.endsWith('.csv')) {
+    return parseCsvPrompts(content);
+  }
 
-  const topCategories = Object.entries(categoryDistribution)
-    .sort((a, b) => b[1] - a[1]).slice(0, 3)
-    .map(([cat, cnt], i) => `  ${i + 1}. ${cat}：${cnt} 条`).join('\n');
+  if (name.endsWith('.jsonl')) {
+    return content
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter(Boolean)
+      .map((line) => {
+        try {
+          return extractDatasetItem(JSON.parse(line));
+        } catch {
+          return { prompt: '' };
+        }
+      })
+      .filter((item) => item.prompt.length > 0);
+  }
 
-  const advice = blockRateNum > 0.4
-    ? '当前拦截率较高，建议检查误报情况'
-    : blockRateNum < 0.2 ? '拦截率偏低，建议加强风险规则配置' : '护栏配置良好，运行正常';
+  if (name.endsWith('.json')) {
+    try {
+      const parsed = JSON.parse(content);
+      if (Array.isArray(parsed)) {
+        return parsed
+          .map((item) => (typeof item === 'string' ? { prompt: item.trim() } : extractDatasetItem(item)))
+          .filter((item) => item.prompt.length > 0);
+      }
+      if (typeof parsed === 'object') {
+        const list = parsed.items || parsed.data || parsed.samples || parsed.prompts;
+        if (!Array.isArray(list)) return [];
+        return list
+          .map((item: any) => (typeof item === 'string' ? { prompt: item.trim() } : extractDatasetItem(item)))
+          .filter((item: DatasetPromptItem) => item.prompt.length > 0);
+      }
+    } catch {
+      return [];
+    }
+    return [];
+  }
 
-  const details = [
-    `📊 数据集测试报告`,
-    `${'─'.repeat(40)}`,
-    `文件名称：${fileName}`,
-    `测试时间：${new Date().toLocaleString()}`,
-    ``,
-    `📁 数据集概览`,
-    `  总样本数：${total} 条`,
-    `  通过样本：${passed} 条`,
-    `  拦截样本：${blocked} 条`,
-    `  拦截率：${(blockRateNum * 100).toFixed(1)}%`,
-    `  平均风险评分：${avgRiskScoreNum.toFixed(3)}`,
-    ``,
-    `🚨 风险等级分布`,
-    `  Critical：${riskDistribution['critical']} 条`,
-    `  High：${riskDistribution['high']} 条`,
-    `  Medium：${riskDistribution['medium']} 条`,
-    `  Low（含通过）：${riskDistribution['low']} 条`,
-    ``,
-    `🏷️ 风险类别 Top 3`,
-    topCategories,
-    ``,
-    `✅ 护栏有效性评估`,
-    `  防御覆盖率：${(blockRateNum * 100).toFixed(1)}%`,
-    `  误报率（估算）：${(rng(30) * 5).toFixed(1)}%`,
-    `  建议：${advice}`,
-  ].join('\n');
-
-  return { total, blocked, passed, blockRate: (blockRateNum * 100).toFixed(1) + '%',
-    avgRiskScore: avgRiskScoreNum.toFixed(3), riskDistribution,
-    categoryDistribution, riskScoreDistribution, details };
+  // txt: 每行一条 prompt
+  return content
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((prompt) => ({ prompt }));
 }
 
 export default function BringYourOwnPage() {
@@ -234,7 +355,6 @@ export default function BringYourOwnPage() {
       blockGaugeChart.current?.dispose();
       const c = echarts.init(blockGaugeRef.current);
       blockGaugeChart.current = c;
-      const blockVal = parseFloat(stats.blockRate);
       c.setOption({
         backgroundColor: 'transparent',
         title: { text: '\u901a\u8fc7 vs \u62e6\u622a\u5bf9\u6bd4', left: 'center', top: 12, textStyle: { color: '#e2e8f0', fontSize: 15, fontWeight: 'bold' } },
@@ -301,16 +421,45 @@ export default function BringYourOwnPage() {
     setError('');
     setDatasetTesting(true);
     setDatasetStats(null);
-    await new Promise(res => setTimeout(res, 1600 + Math.random() * 1400));
-    const stats = simulateDatasetTest(datasetFile.name, datasetFile.size);
-    setDatasetStats(stats);
-    setDatasetTesting(false);
 
-    // 保存数据集测试结果到后端
     try {
-      await testsAPI.saveDatasetTest(categoryId, datasetFile.name, datasetFile.size, stats);
+      const promptItems = await parseDatasetFile(datasetFile);
+      if (promptItems.length === 0) {
+        setError('数据集中未解析到有效 prompt，请检查文件格式（csv/json/jsonl/txt）');
+        return;
+      }
+
+      const response = await testsAPI.saveDatasetTest({
+        categoryId,
+        fileName: datasetFile.name,
+        fileSize: datasetFile.size,
+        promptItems,
+      });
+
+      const data = response.data?.data;
+      const computed = data?.computedStats;
+      if (!computed) {
+        setError('后端未返回数据集统计结果');
+        return;
+      }
+
+      setDatasetStats({
+        total: computed.total,
+        blocked: computed.blocked,
+        passed: computed.passed,
+        blockRate: `${computed.blockRate.toFixed(1)}%`,
+        avgRiskScore: computed.avgRiskScore.toFixed(3),
+        riskDistribution: computed.riskDistribution,
+        categoryDistribution: computed.categoryDistribution,
+        riskScoreDistribution: computed.riskScoreDistribution,
+        metrics: computed.metrics || null,
+        details: computed.details,
+      });
     } catch (err: any) {
-      console.error('Failed to save dataset test:', err);
+      console.error('Dataset test failed:', err);
+      setError(err.response?.data?.message || '数据集测试失败');
+    } finally {
+      setDatasetTesting(false);
     }
   };
 
@@ -348,6 +497,7 @@ export default function BringYourOwnPage() {
           riskDistribution: data.riskDistribution,
           categoryDistribution: data.categoryDistribution,
           riskScoreDistribution: data.riskScoreDistribution,
+          metrics: data.metrics || parseMetricsFromDetails(data.details),
           details: data.details,
         });
       }
@@ -453,16 +603,19 @@ export default function BringYourOwnPage() {
                 {datasetTesting ? (
                   <div className="flex items-center gap-3 text-slate-400 py-8 justify-center">
                     <Loader2 className="w-5 h-5 animate-spin text-indigo-400" />
-                    <span>正在模拟测试，请稍候...</span>
+                    <span>正在进行真实检测，请稍候...</span>
                   </div>
                 ) : datasetStats ? (
                   <>
-                    <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 mb-5">
+                    <div className="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-7 gap-3 mb-5">
                       {[
                         { label: '总样本数', value: datasetStats.total, color: 'text-blue-400' },
                         { label: '通过样本', value: datasetStats.passed, color: 'text-green-400' },
                         { label: '拦截样本', value: datasetStats.blocked, color: 'text-red-400' },
-                        { label: '拦截率',   value: datasetStats.blockRate, color: 'text-orange-400' },
+                        { label: '拦截率', value: datasetStats.blockRate, color: 'text-orange-400' },
+                        { label: '准确率', value: datasetStats.metrics ? `${datasetStats.metrics.accuracy.toFixed(1)}%` : '-', color: 'text-cyan-400' },
+                        { label: '漏报率', value: datasetStats.metrics ? `${datasetStats.metrics.falseNegativeRate.toFixed(1)}%` : '-', color: 'text-rose-400' },
+                        { label: '误报率', value: datasetStats.metrics ? `${datasetStats.metrics.falsePositiveRate.toFixed(1)}%` : '-', color: 'text-amber-300' },
                       ].map(item => (
                         <div key={item.label} className="bg-slate-700/50 rounded-lg p-3 text-center">
                           <p className={`text-2xl font-bold ${item.color}`}>{item.value}</p>
@@ -607,12 +760,15 @@ export default function BringYourOwnPage() {
                 </div>
               ) : (
                 <div className="space-y-4">
-                  <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+                  <div className="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-7 gap-3">
                     {[
                       { label: '总样本数', value: (selectedHistoryItem as DatasetTestResult).total, color: 'text-blue-400' },
                       { label: '通过样本', value: (selectedHistoryItem as DatasetTestResult).passed, color: 'text-green-400' },
                       { label: '拦截样本', value: (selectedHistoryItem as DatasetTestResult).blocked, color: 'text-red-400' },
-                      { label: '拦截率', value: ((selectedHistoryItem as DatasetTestResult).blockRate * 100).toFixed(1) + '%', color: 'text-orange-400' },
+                      { label: '拦截率', value: `${(selectedHistoryItem as DatasetTestResult).blockRate.toFixed(1)}%`, color: 'text-orange-400' },
+                      { label: '准确率', value: datasetStats?.metrics ? `${datasetStats.metrics.accuracy.toFixed(1)}%` : '-', color: 'text-cyan-400' },
+                      { label: '漏报率', value: datasetStats?.metrics ? `${datasetStats.metrics.falseNegativeRate.toFixed(1)}%` : '-', color: 'text-rose-400' },
+                      { label: '误报率', value: datasetStats?.metrics ? `${datasetStats.metrics.falsePositiveRate.toFixed(1)}%` : '-', color: 'text-amber-300' },
                     ].map(item => (
                       <div key={item.label} className="bg-slate-700/50 rounded-lg p-3 text-center">
                         <p className={`text-2xl font-bold ${item.color}`}>{item.value}</p>

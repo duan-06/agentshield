@@ -36,8 +36,14 @@ export const testsAPI = {
 
   getTestMode: () => apiClient.get('/tests/mode'),
 
-  saveDatasetTest: (categoryId: number, fileName: string, fileSize: number, stats: any) =>
-    apiClient.post('/tests/dataset-test', { categoryId, fileName, fileSize, stats }),
+  saveDatasetTest: (payload: {
+    categoryId: number;
+    fileName: string;
+    fileSize: number;
+    stats?: any;
+    prompts?: string[];
+    promptItems?: Array<{ prompt: string; expectedDecision?: 'block' | 'allow' }>;
+  }) => apiClient.post('/tests/dataset-test', payload),
 
   getTestResult: (id: number) =>
     apiClient.get(`/tests/result/${id}`),

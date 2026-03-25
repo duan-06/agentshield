@@ -1,0 +1,55 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+.venv/
+venv*/
+env*/
+.venv*/
+ENV/
+env.bak/
+venv.bak/
+
+# Node.js
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnp/
+.pnp.js
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# 敏感文件
+.env
+.env.local
+.env.*.local
+
+# 构建输出
+dist/
+build/
+*.egg-info/
+
+# 大文件/模型
+*.bin
+*.gguf
+*.model
+datasets/
+*.sql
+
+# 日志
+*.log
+logs/

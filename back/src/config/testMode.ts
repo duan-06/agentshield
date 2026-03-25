@@ -14,7 +14,7 @@ export interface TestModeConfig {
 
 // 从环境变量读取配置
 export const testModeConfig: TestModeConfig = {
-  useMockMode: process.env.USE_MOCK_MODE !== 'false', // 默认启用模拟模式
+  useMockMode: process.env.USE_MOCK_MODE === 'true', // 默认启用真实模式（仅显式设置 true 才启用模拟模式）
   mockDelay: parseInt(process.env.MOCK_DELAY || '500', 10), // 默认 500ms 延迟
   verbose: process.env.VERBOSE_MODE === 'true',
 };

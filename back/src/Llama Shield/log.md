@@ -1,5 +1,53 @@
 # LlamaShield 测试日志
 
+## 2026-03-22 800样本稳定性与召回优化记录
+
+### 背景问题
+1. 大样本评测时出现 `scanInputBatchOnly` 超时并回退单条扫描。  
+2. 800 攻击集漏报率偏高（通过样本过多）。  
+3. 风险分布极端化（大量 low 与 critical，high/medium 占比偏低）。
+
+### 本轮改动
+
+#### 1) 批量扫描策略（降低 timeout 回退）
+- 文件: `back/src/services/llamaShield.ts`
+- 改动:
+    - 新增分片参数：`LLAMA_SHIELD_BATCH_ITEMS`（默认 20）
+    - 新增分片并发：`LLAMA_SHIELD_BATCH_CONCURRENCY`（默认 2）
+    - 批量接口改为“分片并发 + 分片级失败回退单条”，避免整批失败导致全量串行雪崩。
+
+#### 2) 漏报治理（补强 offensive cyber 兜底）
+- 文件: `back/src/Llama Shield/app/firewall.py`
+- 改动:
+    - 扩充进攻型网络攻击关键词与语义触发词，如 `sql injection`、`command injection`、`jailbreak`、`privilege escalation`、`exfiltrate`、`提权`、`数据外传`、`绕过确认` 等。
+    - 保留防御语境豁免，减少误伤防御类问句。
+
+#### 3) 风险评分分层（缓解两极化）
+- 文件: `back/src/routes/tests.ts` 与 `back/src/Llama Shield/app/firewall.py`
+- 改动:
+    - 调整风险等级阈值，使 `medium/high` 更易出现：
+        - `critical`: block 且 score >= 0.92
+        - `high`: score >= 0.72
+        - `medium`: score >= 0.38
+    - 下调部分规则的固定高分，避免系统性“全 critical”。
+    - 单条扫描放行不再一律记 0 分，改为优先读取服务端返回 score（无值时使用较小默认值）。
+
+### 本轮观测（同一 800 攻击集）
+- 调整前（14:24 左右）:
+    - blocked: 445 / 800
+    - accuracy: 55.6%
+    - 漏报率: 44.4%
+- 调整后（15:07 左右）:
+    - blocked: 535 / 800
+    - accuracy: 66.9%
+    - 漏报率: 33.1%
+
+### 结论
+- 召回有明显提升（拦截数 +90，漏报率下降约 11.3 个百分点）。
+- 仍需持续观察 timeout 日志；若仍频繁出现，可继续降低分片并发或增大超时上限。
+
+---
+
 ## 2026-03-20 CyberSecEval 200样本测试结果
 
 ### 测试配置

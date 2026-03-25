@@ -207,6 +207,26 @@ class ScanResponse(BaseModel):
     score: float = 0.0
 
 
+class BatchScanRequest(BaseModel):
+    """批量输入扫描请求"""
+    items: List[ScanRequest] = Field(default_factory=list)
+
+
+class BatchScanItemResult(BaseModel):
+    """批量输入扫描单条结果"""
+    index: int
+    is_blocked: bool
+    decision: str
+    blocked_by: Optional[str] = None
+    blocked_reason: Optional[str] = None
+    score: float = 0.0
+
+
+class BatchScanResponse(BaseModel):
+    """批量输入扫描响应"""
+    results: List[BatchScanItemResult]
+
+
 # ==================== 依赖项 ====================
 
 security = HTTPBearer(auto_error=False)
@@ -263,7 +283,7 @@ async def lifespan(app: FastAPI):
     await firewall_manager.initialize()
 
     # 初始化 LlamaGuard（有害内容检测）
-    if os.getenv("LLAMA_GUARD_ENABLED", "false").lower() == "true":
+    if os.getenv("LLAMA_GUARD_ENABLED", "true").lower() == "true":
         logger.info("Initializing LlamaGuard...")
         from app.firewall import initialize_llamaguard
         await initialize_llamaguard()
@@ -689,6 +709,62 @@ async def scan_input(
         )
 
 
+@app.post("/api/v1/scan/input/batch", response_model=BatchScanResponse)
+async def scan_input_batch(
+    request: BatchScanRequest,
+    user: dict = Depends(get_current_user)
+):
+    """
+    批量扫描用户输入，不生成响应。
+
+    说明：
+    - 与 /api/v1/scan/input 共享同一底层 scan_input 逻辑，保证检测口径一致。
+    - 仅减少 HTTP 往返与序列化开销，提升大数据集吞吐。
+    """
+    try:
+        max_items = int(os.getenv("BATCH_SCAN_MAX_ITEMS", "200"))
+        if len(request.items) == 0:
+            return BatchScanResponse(results=[])
+        if len(request.items) > max_items:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail={"error": f"Too many items in batch. Max allowed: {max_items}"}
+            )
+
+        raw_concurrency = int(os.getenv("BATCH_SCAN_CONCURRENCY", "8"))
+        concurrency = max(1, min(16, raw_concurrency))
+        semaphore = asyncio.Semaphore(concurrency)
+        request_base_id = f"batch-{int(time.time() * 1000)}"
+
+        async def _scan_one(index: int, item: ScanRequest) -> BatchScanItemResult:
+            async with semaphore:
+                result = await firewall_manager.scan_input(
+                    messages=item.messages,
+                    request_id=f"{request_base_id}-{index}"
+                )
+                return BatchScanItemResult(
+                    index=index,
+                    is_blocked=result.is_blocked,
+                    decision=result.decision,
+                    blocked_by=result.blocked_by,
+                    blocked_reason=result.blocked_reason,
+                    score=result.score,
+                )
+
+        tasks = [_scan_one(i, item) for i, item in enumerate(request.items)]
+        results = await asyncio.gather(*tasks)
+        results.sort(key=lambda x: x.index)
+        return BatchScanResponse(results=results)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Batch input scan error: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail={"error": str(e)}
+        )
+
+
 # ==================== 统计端点 ====================
 
 @app.get("/api/v1/stats")
@@ -708,10 +784,15 @@ async def get_stats():
 
 if __name__ == "__main__":
     import uvicorn
+
+    host = os.getenv("HOST", "127.0.0.1")
+    port = int(os.getenv("PORT", "18000"))
+    log_level = os.getenv("UVICORN_LOG_LEVEL", "info")
+
     uvicorn.run(
         "app.main:app",
-        host="0.0.0.0",
-        port=8000,
+        host=host,
+        port=port,
         reload=False,
-        log_level="info"
+        log_level=log_level
     )

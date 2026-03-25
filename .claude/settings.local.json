@@ -1,7 +1,9 @@
 {
   "permissions": {
     "allow": [
-      "Bash(python -c \":*)"
+      "Bash(python -c \":*)",
+      "Read(//d/计算机设计大赛/打包/**)",
+      "Bash(unzip -l agentshield_source.zip)"
     ]
   }
 }

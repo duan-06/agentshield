@@ -11,24 +11,33 @@ dotenv.config();
 const app: Express = express();
 const prisma = new PrismaClient();
 const PORT = process.env.PORT || 3001;
+const BODY_LIMIT = process.env.BODY_LIMIT || '20mb';
 
 // Middleware
 app.use(cors());
-app.use(express.json());
-
-// Error handling middleware
-app.use((err: any, req: Request, res: Response, next: NextFunction) => {
-  console.error(err);
-  res.status(err.status || 500).json({
-    success: false,
-    message: err.message || 'Internal Server Error',
-  });
-});
+app.use(express.json({ limit: BODY_LIMIT }));
+app.use(express.urlencoded({ extended: true, limit: BODY_LIMIT }));
 
 // Routes
 app.use('/api/auth', authRoutes);
 app.use('/api/tests', testRoutes);
 app.use('/api/stats', statsRoutes);
+
+// Error handling middleware
+app.use((err: any, req: Request, res: Response, next: NextFunction) => {
+  if (err?.type === 'entity.too.large') {
+    return res.status(413).json({
+      success: false,
+      message: `Request entity too large. Current limit is ${BODY_LIMIT}.`,
+    });
+  }
+
+  console.error(err);
+  return res.status(err.status || 500).json({
+    success: false,
+    message: err.message || 'Internal Server Error',
+  });
+});
 
 // Health check
 app.get('/health', (req: Request, res: Response) => {
