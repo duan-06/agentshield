@@ -2,15 +2,17 @@
 Llama Shield - Pydantic 数据模型
 """
 
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Union
 from pydantic import BaseModel, Field
 from datetime import datetime
 
 
 class Message(BaseModel):
-    """消息模型"""
+    """消息模型 - 支持纯文本和多模态内容"""
     role: str = Field(..., description="消息角色: user/assistant/system")
     content: str = Field(..., description="消息内容")
+    imageBase64: Optional[str] = Field(None, description="Base64 encoded image (PNG/JPEG)")
+    imageUrl: Optional[str] = Field(None, description="Image URL for multimodal input")
 
 
 class ChatRequest(BaseModel):

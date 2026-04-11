@@ -16,6 +16,24 @@ apiClient.interceptors.request.use((config) => {
   return config;
 });
 
+// Handle expired/invalid token globally
+apiClient.interceptors.response.use(
+  (response) => response,
+  (error) => {
+    const status = error?.response?.status;
+    const message = error?.response?.data?.message;
+
+    if (status === 401 && (message === 'Invalid token' || message === 'Token expired' || message === 'No token provided')) {
+      useAuthStore.getState().logout();
+      if (typeof window !== 'undefined' && window.location.pathname !== '/login') {
+        window.location.href = '/login';
+      }
+    }
+
+    return Promise.reject(error);
+  }
+);
+
 export const authAPI = {
   register: (username: string, email: string, password: string) =>
     apiClient.post('/auth/register', { username, email, password }),
@@ -29,6 +47,15 @@ export const testsAPI = {
 
   evaluate: (categoryId: number, input: string, evaluationCriteria?: string) =>
     apiClient.post('/tests/evaluate', { categoryId, input, evaluationCriteria }),
+
+  // 多模态评估（支持文本 + 图像）
+  evaluateMultimodal: (categoryId: number, input: string, imageBase64?: string, imageUrl?: string) =>
+    apiClient.post('/tests/evaluate-multimodal', {
+      categoryId,
+      input,
+      imageBase64: imageBase64 || undefined,
+      imageUrl: imageUrl || undefined,
+    }),
 
   getHistory: () => apiClient.get('/tests/history'),
 

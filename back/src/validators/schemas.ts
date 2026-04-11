@@ -34,4 +34,6 @@ export const testEvaluateSchema = Joi.object({
   categoryId: Joi.number().required(),
   input: Joi.string().required(),
   evaluationCriteria: Joi.string().allow('').optional(),
+  imageBase64: Joi.string().allow('').optional().description('Base64 encoded image for multimodal evaluation'),
+  imageUrl: Joi.string().uri().allow('').optional().description('Image URL for multimodal evaluation'),
 });

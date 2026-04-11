@@ -187,6 +187,60 @@ function parseMetricsFromDetails(details: string): DatasetEvalMetrics | null {
   };
 }
 
+function sanitizeOutputForDisplay(raw: unknown): {
+  text: string;
+  thinkRemoved: boolean;
+} {
+  if (typeof raw !== 'string') {
+    return { text: '', thinkRemoved: false };
+  }
+
+  let text = raw;
+
+  // 1) 去掉成对 <think>...</think> 段
+  const pairedThinkPattern = /<think>[\s\S]*?<\/think>/gi;
+  const hadPairedThink = pairedThinkPattern.test(text);
+  text = text.replace(pairedThinkPattern, '');
+
+  // 2) 兜底：若只出现开标签没有闭标签，直接截掉后续内容
+  const openThinkIndex = text.toLowerCase().indexOf('<think>');
+  const hadUnclosedThink = openThinkIndex >= 0;
+  if (hadUnclosedThink) {
+    text = text.slice(0, openThinkIndex);
+  }
+
+  // 3) 清理空白
+  text = text.replace(/\n{3,}/g, '\n\n').trim();
+
+  return {
+    text,
+    thinkRemoved: hadPairedThink || hadUnclosedThink,
+  };
+}
+
+function buildFormalReply(params: {
+  decision: string;
+  blockedText: string;
+  riskLevel: string;
+  riskScore: unknown;
+  blockedBy: string;
+  blockedReason?: string;
+}): string {
+  const {
+    decision,
+    blockedText,
+    riskLevel,
+    riskScore,
+    blockedBy,
+    blockedReason,
+  } = params;
+
+  const scoreText = typeof riskScore === 'number' ? riskScore.toFixed(3) : (riskScore ?? 'N/A');
+  const reasonText = blockedReason ? `主要原因为：${blockedReason}。` : '';
+
+  return `系统评估结论如下：当前决策为 ${decision}（是否拦截：${blockedText}），风险等级为 ${riskLevel}，风险评分为 ${scoreText}，判定来源为 ${blockedBy}。${reasonText}`;
+}
+
 async function parseDatasetFile(file: File): Promise<DatasetPromptItem[]> {
   const content = await file.text();
   const name = file.name.toLowerCase();
@@ -254,7 +308,13 @@ export default function BringYourOwnPage() {
   const [selectedHistoryItem, setSelectedHistoryItem] = useState<TestResult | DatasetTestResult | null>(null);
   const [showDetailModal, setShowDetailModal] = useState(false);
   const [detailLoading, setDetailLoading] = useState(false);
+  // 多模态图片支持
+  const [imageFile, setImageFile] = useState<File | null>(null);
+  const [imageBase64, setImageBase64] = useState<string>('');
+  const [showImagePreview, setShowImagePreview] = useState(false);
+  const [multimodalMetadata, setMultimodalMetadata] = useState<any>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const imageInputRef = useRef<HTMLInputElement>(null);
   const riskPieRef     = useRef<HTMLDivElement>(null);
   const categoryBarRef = useRef<HTMLDivElement>(null);
   const scoreHistRef   = useRef<HTMLDivElement>(null);
@@ -387,13 +447,127 @@ export default function BringYourOwnPage() {
 
   const handleEvaluate = async () => {
     if (!input.trim()) { setError('请输入要测试的内容'); return; }
-    setLoading(true); setError(''); setOutput('');
+    setLoading(true);
+    setError('');
+    setOutput('');
+    
     try {
-      const response = await testsAPI.evaluate(categoryId, input);
-      setOutput(response.data.data.output || '评估完成');
+      let response;
+      // 如果有图片，使用多模态评估接口
+      if (imageBase64 || imageFile) {
+        response = await testsAPI.evaluateMultimodal(categoryId, input, imageBase64);
+      } else {
+        // 否则使用普通评估接口
+        response = await testsAPI.evaluate(categoryId, input);
+      }
+      
+      const data = response.data.data;
+      const isBlocked = data.isBlocked ?? data.scanResult?.is_blocked;
+      const riskScore = data.riskScore ?? data.scanResult?.score;
+      const riskLevel = data.riskLevel ?? 'unknown';
+      const decision = data.decision || data.scanResult?.decision || (isBlocked ? 'BLOCK' : 'ALLOW');
+      const blockedBy = data.blockedBy ?? data.scanResult?.blocked_by ?? (isBlocked ? 'Unknown' : 'Pass');
+      const blockedReason = data.blockedReason ?? data.scanResult?.blocked_reason ?? '';
+      const blockedText = decision === 'ERROR' ? '扫描失败' : (isBlocked ? '是' : '否');
+
+      const summaryLines = [
+        `决策: ${decision}`,
+        `是否拦截: ${blockedText}`,
+        `风险评分: ${typeof riskScore === 'number' ? riskScore.toFixed(3) : riskScore ?? 'N/A'}`,
+        `风险等级: ${riskLevel}`,
+        `阻断来源: ${blockedBy}`,
+      ];
+
+      if (blockedReason) {
+        summaryLines.push(`阻断原因: ${blockedReason}`);
+      }
+
+      if (data.output) {
+        const sanitized = sanitizeOutputForDisplay(data.output);
+        summaryLines.push('', '详细输出:');
+        summaryLines.push(
+          sanitized.text ||
+            buildFormalReply({
+              decision,
+              blockedText,
+              riskLevel,
+              riskScore,
+              blockedBy,
+              blockedReason,
+            })
+        );
+      } else {
+        summaryLines.push(
+          '',
+          '详细输出:',
+          buildFormalReply({
+            decision,
+            blockedText,
+            riskLevel,
+            riskScore,
+            blockedBy,
+            blockedReason,
+          })
+        );
+      }
+
+      setOutput(summaryLines.join('\n'));
+      
+      // 保存多模态元数据用于展示
+      if (data.metadata) {
+        setMultimodalMetadata(data.metadata);
+      } else {
+        setMultimodalMetadata(null);
+      }
     } catch (err: any) {
       setError(err.response?.data?.message || '评估失败');
-    } finally { setLoading(false); }
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  // 处理图片文件上传
+  const handleImageChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    // 验证文件大小（限制 5MB）
+    if (file.size > 5 * 1024 * 1024) {
+      setError('图片文件大小不能超过 5MB');
+      return;
+    }
+
+    // 验证文件类型
+    if (!file.type.startsWith('image/')) {
+      setError('请选择有效的图片文件');
+      return;
+    }
+
+    setImageFile(file);
+    setError('');
+
+    // 转换为 base64
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      const base64String = e.target?.result as string;
+      setImageBase64(base64String);
+      setShowImagePreview(true);
+    };
+    reader.onerror = () => {
+      setError('读取图片文件失败');
+    };
+    reader.readAsDataURL(file);
+  };
+
+  // 清除图片
+  const clearImage = () => {
+    setImageFile(null);
+    setImageBase64('');
+    setShowImagePreview(false);
+    setMultimodalMetadata(null);
+    if (imageInputRef.current) {
+      imageInputRef.current.value = '';
+    }
   };
 
   const fetchHistory = async () => {
@@ -482,7 +656,17 @@ export default function BringYourOwnPage() {
       if (item.type === 'single') {
         const response = await testsAPI.getTestResult(item.id);
         setSelectedHistoryItem(response.data.data);
-        setOutput(response.data.data.output);
+        const sanitized = sanitizeOutputForDisplay(response.data.data.output);
+        const raw = response.data.data;
+        const fallback = buildFormalReply({
+          decision: String(raw.decision || 'UNKNOWN'),
+          blockedText: raw.isBlocked ? '是' : '否',
+          riskLevel: String(raw.riskLevel || 'unknown'),
+          riskScore: raw.riskScore,
+          blockedBy: String(raw.blockedBy || 'Unknown'),
+          blockedReason: raw.blockedReason,
+        });
+        setOutput(sanitized.text || fallback);
         setInput(response.data.data.input);
       } else {
         const response = await testsAPI.getDatasetResult(item.id);
@@ -546,6 +730,53 @@ export default function BringYourOwnPage() {
               placeholder="输入要测试的内容..."
               className="w-full h-32 px-4 py-3 bg-slate-700/50 border border-slate-600 rounded text-white placeholder-gray-500 focus:outline-none focus:border-blue-500 transition-colors resize-none"
             />
+            
+            {/* 图片上传区域 */}
+            <div className="mt-4">
+              <label className="text-sm text-slate-400 mb-2 block">上传图片（可选）</label>
+              <div
+                onClick={() => imageInputRef.current?.click()}
+                className="flex items-center justify-center gap-3 border-2 border-dashed border-slate-600 hover:border-purple-500 rounded p-6 cursor-pointer transition-colors group bg-slate-700/20 hover:bg-slate-700/40"
+              >
+                <Upload className="w-5 h-5 text-slate-500 group-hover:text-purple-400 transition-colors" />
+                <span className="text-slate-400 group-hover:text-slate-300 text-sm transition-colors">
+                  {imageFile ? `已选择: ${imageFile.name}` : '点击选择图片或拖拽上传（JPG/PNG, ≤5MB）'}
+                </span>
+                <input
+                  ref={imageInputRef}
+                  type="file"
+                  accept="image/jpeg,image/png,image/jpg"
+                  className="hidden"
+                  onChange={handleImageChange}
+                />
+              </div>
+
+              {/* 图片预览 */}
+              {showImagePreview && imageBase64 && (
+                <div className="mt-4 relative">
+                  <div className="flex items-start gap-4">
+                    <div className="flex-shrink-0">
+                      <img
+                        src={imageBase64}
+                        alt="预览"
+                        className="h-32 w-32 object-cover rounded border border-slate-600"
+                      />
+                    </div>
+                    <div className="flex-1">
+                      <p className="text-sm text-slate-400">图片已上传</p>
+                      <p className="text-xs text-slate-500 mt-1">大小: {(imageFile!.size / 1024).toFixed(1)} KB</p>
+                      <button
+                        onClick={clearImage}
+                        className="mt-2 flex items-center gap-1 px-3 py-1 text-xs bg-red-500/20 hover:bg-red-500/30 text-red-300 rounded transition-colors"
+                      >
+                        <X className="w-3 h-3" /> 移除图片
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              )}
+            </div>
+
             <button onClick={handleEvaluate} disabled={loading}
               className="mt-4 flex items-center gap-2 px-6 py-2 bg-blue-500 hover:bg-blue-600 disabled:bg-gray-600 text-white font-semibold rounded transition-colors">
               <Send className="w-4 h-4" />
@@ -559,6 +790,49 @@ export default function BringYourOwnPage() {
             <div className="min-h-32 px-4 py-3 bg-slate-700/50 border border-slate-600 rounded text-gray-300 font-mono text-sm whitespace-pre-wrap break-words">
               {output || '评估结果将显示在这里...'}
             </div>
+            
+            {/* 多模态元数据展示 */}
+            {multimodalMetadata && (
+              <div className="mt-4 border-t border-slate-600 pt-4">
+                <h4 className="text-sm font-semibold text-slate-300 mb-3">多模态扫描详情</h4>
+                <div className="space-y-2 text-sm">
+                  <div>
+                    <p className="text-slate-400">
+                      <span className="font-semibold text-slate-300">OCR 提取文本：</span>
+                    </p>
+                    <p className="text-slate-300 ml-4 mt-1 p-2 bg-slate-900/50 rounded border border-slate-700">
+                      {multimodalMetadata.ocrText && String(multimodalMetadata.ocrText).trim().length > 0
+                        ? multimodalMetadata.ocrText
+                        : '（未识别到有效文本）'}
+                    </p>
+                  </div>
+                  {multimodalMetadata.ocrQuality !== undefined && (
+                    <p className="text-slate-400">
+                      <span className="font-semibold text-slate-300">OCR 质量分：</span>
+                      <span className="ml-2 text-cyan-300">{Number(multimodalMetadata.ocrQuality).toFixed(3)}</span>
+                    </p>
+                  )}
+                  {multimodalMetadata.forceHeavyCheck !== undefined && (
+                    <p className="text-slate-400">
+                      <span className="font-semibold text-slate-300">低质量强制重检：</span>
+                      <span className="ml-2 text-amber-300">{multimodalMetadata.forceHeavyCheck ? '是' : '否'}</span>
+                    </p>
+                  )}
+                  {multimodalMetadata.lightScore !== undefined && (
+                    <p className="text-slate-400">
+                      <span className="font-semibold text-slate-300">轻量层分数：</span>
+                      <span className="ml-2 text-purple-300">{multimodalMetadata.lightScore?.toFixed(3)}</span>
+                    </p>
+                  )}
+                  {multimodalMetadata.minimaxScore !== undefined && (
+                    <p className="text-slate-400">
+                      <span className="font-semibold text-slate-300">MiniMax 重检分数：</span>
+                      <span className="ml-2 text-purple-300">{multimodalMetadata.minimaxScore?.toFixed(3)}</span>
+                    </p>
+                  )}
+                </div>
+              </div>
+            )}
           </div>
 
           {/* Dataset Test Module */}

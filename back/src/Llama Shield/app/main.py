@@ -10,7 +10,7 @@ import time
 import logging
 import asyncio
 from contextlib import asynccontextmanager
-from typing import Optional, List, Dict
+from typing import Optional, List, Dict, Any
 
 # 加载 .env 文件
 from dotenv import load_dotenv
@@ -38,7 +38,7 @@ USE_VLLM = os.getenv("USE_VLLM", "false").lower() == "true"
 # MiniMax API 配置
 USE_MINIMAX_API = os.getenv("USE_MINIMAX_API", "false").lower() == "true"
 MINIMAX_API_KEY = os.getenv("MINIMAX_API_KEY", "")
-MINIMAX_MODEL = os.getenv("MINIMAX_MODEL", "MiniMax-M2.5")
+MINIMAX_MODEL = os.getenv("MINIMAX_MODEL", "minimax-m2.7")
 MINIMAX_BASE_URL = os.getenv("MINIMAX_BASE_URL", "https://api.minimax.chat/v1")
 
 # 配置日志
@@ -762,6 +762,113 @@ async def scan_input_batch(
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail={"error": str(e)}
+        )
+
+
+# ==================== 多模态扫描端点 ====================
+
+class MultimodalScanRequest(BaseModel):
+    """多模态扫描请求"""
+    messages: List[Dict[str, str]] = Field(
+        ...,
+        description="消息列表"
+    )
+    imageBase64: Optional[str] = Field(None, description="Base64 encoded image")
+    imageUrl: Optional[str] = Field(None, description="Image URL")
+
+
+class MultimodalScanResponse(BaseModel):
+    """多模态扫描响应"""
+    is_blocked: bool
+    decision: str
+    blocked_by: Optional[str] = None
+    blocked_reason: Optional[str] = None
+    score: float
+    metadata: Optional[Dict[str, Any]] = None
+
+
+@app.post("/api/v1/scan/multimodal")
+async def scan_multimodal(
+    request: MultimodalScanRequest,
+    http_request: Request,
+    user: dict = Depends(get_current_user)
+):
+    """
+    多模态扫描端点（文本 + 图像）
+
+    使用三层策略：
+    1. 轻量层：OCR + PromptGuard + 规则（秒级）
+    2. 疑似层：MiniMax 多模态重检
+    3. 融合决策：加权融合分数
+
+    Args:
+        request: 多模态扫描请求（包含消息和图像）
+        http_request: HTTP 请求对象
+        user: 当前用户信息
+
+    Returns:
+        MultimodalScanResponse: 扫描结果
+    """
+    request_id = http_request.headers.get(
+        "X-Request-ID",
+        f"mmscan-{int(time.time() * 1000)}"
+    )
+
+    try:
+        logger.info(
+            "Multimodal scan request received",
+            request_id=request_id,
+            has_image=bool(request.imageBase64 or request.imageUrl)
+        )
+
+        # 执行多模态扫描
+        result = await firewall_manager.scan_multimodal_input(
+            messages=request.messages,
+            image_base64=request.imageBase64,
+            image_url=request.imageUrl,
+            request_id=request_id
+        )
+
+        if result.is_blocked:
+            logger.warning(
+                "Multimodal input blocked",
+                request_id=request_id,
+                blocked_by=result.blocked_by,
+                score=result.score
+            )
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail={
+                    "is_blocked": True,
+                    "decision": result.decision,
+                    "blocked_by": result.blocked_by,
+                    "blocked_reason": result.blocked_reason,
+                    "score": result.score,
+                    "metadata": result.metadata,
+                    "request_id": request_id
+                }
+            )
+
+        logger.info(
+            "Multimodal input allowed",
+            request_id=request_id,
+            score=result.score
+        )
+
+        return MultimodalScanResponse(
+            is_blocked=False,
+            decision=result.decision,
+            score=result.score,
+            metadata=result.metadata
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Multimodal scan error: {e}", request_id=request_id)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail={"error": "Multimodal scan failed", "request_id": request_id}
         )
 
 

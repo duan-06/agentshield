@@ -63,3 +63,10 @@ aiofiles>=24.1.0
 python-dateutil>=2.9.0
 pyyaml>=6.0.2
 typing-extensions>=4.12.2
+
+# OCR（替换原 Tesseract 路径，使用 PaddleOCR）
+paddleocr==2.7.3
+paddlepaddle==2.6.2
+opencv-python==4.6.0.66
+opencv-contrib-python==4.6.0.66
+numpy==1.26.4

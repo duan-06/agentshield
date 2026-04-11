@@ -53,3 +53,25 @@ datasets/
 # 日志
 *.log
 logs/
+
+# 本地评测/临时产物
+misclassified_output.json
+front/out.txt
+test.csv
+tmp_eval_*.js
+picture/
+cloud.md
+
+# 临时分析脚本
+scripts/tmp_*.py
+scripts/analyze_misclassified_quick.py
+scripts/extract_misclassified_multimodal.py
+scripts/find_allowed_multimodal.py
+scripts/tmp_export_multimodal_70_csv.py
+scripts/tmp_test_multimodal_subset.py
+
+# Llama Shield 评测输出
+back/src/Llama Shield/cyberseceval_test_results/
+back/src/Llama Shield/test_report_*.txt
+back/src/Llama Shield/requirements_tmp.txt
+back/src/Llama Shield/tmp_*.py

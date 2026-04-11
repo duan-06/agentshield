@@ -63,6 +63,9 @@ model TestResult {
   riskLevel   String  // "low", "medium", "high", "critical"
   riskScore   Float   @default(0)
   testType    String  @default("single")  // "single" or "dataset"
+  imageUrl    String? @db.Text  // 多模态: 上传的图像 URL 或 base64
+  ocrText     String? @db.Text  // 多模态: OCR 提取的图片文本
+  multimodalMetadata String? @db.Text  // 多模态: 分层扫描元数据 (JSON)
   createdAt   DateTime @default(now())
 
   @@map("test_results")
