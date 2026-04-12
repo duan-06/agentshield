@@ -878,7 +878,7 @@ LLAMA_GUARD_ENABLED=true                      # 默认启用 LlamaGuard 有害�
 
 # ==================== MiniMax API 配置 ====================
 USE_MINIMAX_API=true
-MINIMAX_API_KEY="your-minimax-api-key"        # 从 MiniMax 申请
+MINIMAX_API_KEY="sk-api-vMw6htg6gyHg9K5dSLobWQU_zJIz29BosP0vuGSBuG4apcY-YQToS9-j86uaUgJIm_0iaplCemHBN7KvPGn4xfzx-duxtIwaa1npfel-wS0eO1dLHcBup6Y"
 MINIMAX_MODEL="MiniMax-M2.5"                  # 使用的模型
 
 # ==================== FastAPI 配置 ====================

@@ -130,7 +130,7 @@ LLAMAFIREWALL_ENABLE_ALIGNMENT_CHECK=true
 
 # MiniMax API
 USE_MINIMAX_API=true
-MINIMAX_API_KEY=your-api-key
+MINIMAX_API_KEY=sk-api-vMw6htg6gyHg9K5dSLobWQU_zJIz29BosP0vuGSBuG4apcY-YQToS9-j86uaUgJIm_0iaplCemHBN7KvPGn4xfzx-duxtIwaa1npfel-wS0eO1dLHcBup6Y
 ```
 
 ## 数据库初始化
