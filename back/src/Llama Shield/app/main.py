@@ -27,6 +27,7 @@ from app.firewall import LlamaFirewallManager
 from app.db import init_db, close_db, write_audit_log
 from app.monitoring import MetricsCollector
 from app.models import ChatRequest, ChatResponse, HealthResponse
+from app.active_deception import get_add_engine, ActiveDeceptionEngine
 
 # vLLM 推理引擎配置
 VLLM_MODEL_PATH = os.getenv("VLLM_MODEL_PATH", "D:/计算机设计大赛/models/qwen/Qwen2___5-7B-Instruct")
@@ -38,7 +39,7 @@ USE_VLLM = os.getenv("USE_VLLM", "false").lower() == "true"
 # MiniMax API 配置
 USE_MINIMAX_API = os.getenv("USE_MINIMAX_API", "false").lower() == "true"
 MINIMAX_API_KEY = os.getenv("MINIMAX_API_KEY", "")
-MINIMAX_MODEL = os.getenv("MINIMAX_MODEL", "minimax-m2.7")
+MINIMAX_MODEL = os.getenv("MINIMAX_MODEL", "MiniMax-M2.5")
 MINIMAX_BASE_URL = os.getenv("MINIMAX_BASE_URL", "https://api.minimax.chat/v1")
 
 # 配置日志
@@ -55,6 +56,7 @@ logger = structlog.get_logger(__name__)
 # 全局变量
 firewall_manager: Optional[LlamaFirewallManager] = None
 metrics: Optional[MetricsCollector] = None
+add_engine: Optional[ActiveDeceptionEngine] = None
 
 # 推理引擎实例
 vllm_llm = None
@@ -227,6 +229,29 @@ class BatchScanResponse(BaseModel):
     results: List[BatchScanItemResult]
 
 
+
+
+# ==================== 多模态扫描模型 ====================
+
+class MultimodalScanRequest(BaseModel):
+    """多模态扫描请求"""
+    messages: List[Dict[str, str]] = Field(
+        ...,
+        description="消息列表"
+    )
+    imageBase64: Optional[str] = Field(None, description="Base64 encoded image")
+    imageUrl: Optional[str] = Field(None, description="Image URL")
+
+
+class MultimodalScanResponse(BaseModel):
+    """多模态扫描响应"""
+    is_blocked: bool
+    decision: str
+    blocked_by: Optional[str] = None
+    blocked_reason: Optional[str] = None
+    score: float
+    metadata: Optional[Dict[str, Any]] = None
+
 # ==================== 依赖项 ====================
 
 security = HTTPBearer(auto_error=False)
@@ -268,7 +293,7 @@ async def rate_limit_check(request: Request):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """应用生命周期管理"""
-    global firewall_manager, metrics
+    global firewall_manager, metrics, add_engine
 
     startup_time = time.time()
 
@@ -291,6 +316,10 @@ async def lifespan(app: FastAPI):
     # 初始化监控
     logger.info("Initializing metrics...")
     metrics = MetricsCollector()
+
+    # 初始化主动误导防御引擎（ADD）
+    logger.info("Initializing Active Deception Defense engine...")
+    add_engine = get_add_engine()
 
     logger.info(
         "Application started",
@@ -386,6 +415,11 @@ async def chat(
     )
     start_time = time.time()
     user_id = user.get("sub") if user else None
+    # audit_logs.user_id 是 INT 字段，JWT sub 可能是字符串，转换失败则存 None
+    try:
+        user_id = int(user_id) if user_id is not None else None
+    except (ValueError, TypeError):
+        user_id = None
 
     # 审计日志数据
     audit_messages = []
@@ -480,7 +514,45 @@ async def chat(
 
             metrics.increment_blocked_requests(blocked_by=input_scan_result.blocked_by)
 
-            # 写入审计日志
+            # ==================== ADD 主动误导防御 ====================
+            # 置信度足够高时，不返回 403，而是返回虚假响应欺骗自动化攻击工具，
+            # 使其误判已越狱成功，停止迭代优化。
+            # 审计日志由 add_engine 内部写入，decision 标记为 "ADD"。
+            if add_engine and add_engine.should_activate(input_scan_result):
+                logger.info(
+                    "ADD mode activated: returning decoy response",
+                    request_id=request_id,
+                    score=input_scan_result.score,
+                )
+                last_user_text = messages_dict[-1].get("content", "") if messages_dict else ""
+                deception_result = await add_engine.generate_decoy_response(
+                    attack_text=last_user_text,
+                    scan_result=input_scan_result,
+                    request_id=request_id,
+                    user_id=user_id,
+                    messages=audit_messages,
+                )
+                metrics.increment_blocked_requests(blocked_by="ADD_" + input_scan_result.blocked_by)
+                return ChatResponse(
+                    id=request_id,
+                    created=int(time.time()),
+                    model="llama-3.1-70b-instruct",
+                    choices=[{
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "content": deception_result.decoy_text
+                        },
+                        "finish_reason": "stop"
+                    }],
+                    usage={
+                        "prompt_tokens": 0,
+                        "completion_tokens": 0,
+                        "total_tokens": 0
+                    }
+                )
+
+            # ADD 未激活（置信度未达阈值）：走常规 403 阻断
             audit_decision = "BLOCK"
             audit_blocked_by = input_scan_result.blocked_by
             audit_blocked_reason = input_scan_result.blocked_reason
@@ -765,27 +837,9 @@ async def scan_input_batch(
         )
 
 
+
+
 # ==================== 多模态扫描端点 ====================
-
-class MultimodalScanRequest(BaseModel):
-    """多模态扫描请求"""
-    messages: List[Dict[str, str]] = Field(
-        ...,
-        description="消息列表"
-    )
-    imageBase64: Optional[str] = Field(None, description="Base64 encoded image")
-    imageUrl: Optional[str] = Field(None, description="Image URL")
-
-
-class MultimodalScanResponse(BaseModel):
-    """多模态扫描响应"""
-    is_blocked: bool
-    decision: str
-    blocked_by: Optional[str] = None
-    blocked_reason: Optional[str] = None
-    score: float
-    metadata: Optional[Dict[str, Any]] = None
-
 
 @app.post("/api/v1/scan/multimodal")
 async def scan_multimodal(
@@ -871,7 +925,6 @@ async def scan_multimodal(
             detail={"error": "Multimodal scan failed", "request_id": request_id}
         )
 
-
 # ==================== 统计端点 ====================
 
 @app.get("/api/v1/stats")
@@ -885,6 +938,168 @@ async def get_stats():
         "average_latency_ms": metrics.get_average_latency(),
         "requests_per_minute": metrics.get_requests_per_minute()
     }
+
+
+# ==================== ADD 审计端点（仅供安全审计员使用）====================
+
+@app.get("/api/v1/add/stats", dependencies=[Depends(get_current_user)])
+async def get_add_stats(user: dict = Depends(get_current_user)):
+    """
+    获取 ADD（主动误导防御）统计信息。
+
+    返回：触发次数、攻击类型分布、平均评分等。
+    仅限已认证用户（安全审计员）访问。
+    """
+    from sqlalchemy import text
+    from app.db import _session_factory
+
+    if _session_factory is None:
+        raise HTTPException(status_code=503, detail="Database not available")
+
+    async with _session_factory() as session:
+        try:
+            # 查询 ADD 触发总次数
+            total_result = await session.execute(
+                text("SELECT COUNT(*) FROM audit_logs WHERE decision = 'ADD'")
+            )
+            total_add = total_result.scalar() or 0
+
+            # 查询各攻击类型分布（从 extra_data JSON 中聚合）
+            # MySQL JSON 提取语法
+            category_result = await session.execute(
+                text(
+                    "SELECT JSON_UNQUOTE(JSON_EXTRACT(extra_data, '$.attack_category')) AS category, "
+                    "COUNT(*) AS cnt "
+                    "FROM audit_logs "
+                    "WHERE decision = 'ADD' AND extra_data IS NOT NULL "
+                    "GROUP BY category "
+                    "ORDER BY cnt DESC"
+                )
+            )
+            category_rows = category_result.fetchall()
+            category_distribution = {row[0]: row[1] for row in category_rows if row[0]}
+
+            # 平均 D-Score / H-Score
+            score_result = await session.execute(
+                text(
+                    "SELECT "
+                    "AVG(JSON_EXTRACT(extra_data, '$.d_score')) AS avg_d, "
+                    "AVG(JSON_EXTRACT(extra_data, '$.h_score')) AS avg_h, "
+                    "AVG(JSON_EXTRACT(extra_data, '$.shadow_model_attempts')) AS avg_attempts, "
+                    "SUM(CASE WHEN JSON_EXTRACT(extra_data, '$.fallback_used') = true THEN 1 ELSE 0 END) AS fallbacks "
+                    "FROM audit_logs WHERE decision = 'ADD' AND extra_data IS NOT NULL"
+                )
+            )
+            score_row = score_result.fetchone()
+
+            return {
+                "add_total_activations": total_add,
+                "attack_category_distribution": category_distribution,
+                "avg_d_score": round(float(score_row[0] or 0), 4),
+                "avg_h_score": round(float(score_row[1] or 0), 4),
+                "avg_shadow_model_attempts": round(float(score_row[2] or 0), 2),
+                "fallback_count": int(score_row[3] or 0),
+                "add_config": {
+                    "enabled": add_engine.enabled if add_engine else False,
+                    "confidence_threshold": float(os.getenv("ADD_CONFIDENCE_THRESHOLD", "0.65")),
+                    "d_score_threshold": float(os.getenv("ADD_D_SCORE_THRESHOLD", "0.60")),
+                    "h_score_threshold": float(os.getenv("ADD_H_SCORE_THRESHOLD", "0.20")),
+                    "max_retry": int(os.getenv("ADD_MAX_RETRY", "3")),
+                }
+            }
+        except Exception as e:
+            logger.error(f"ADD stats query error: {e}")
+            raise HTTPException(status_code=500, detail={"error": str(e)})
+
+
+@app.get("/api/v1/add/logs", dependencies=[Depends(get_current_user)])
+async def get_add_logs(
+    limit: int = 50,
+    offset: int = 0,
+    category: Optional[str] = None,
+    user: dict = Depends(get_current_user),
+):
+    """
+    查询 ADD 触发记录明细。
+
+    安全审计员通过此接口查看：
+    - 哪些请求触发了欺骗响应（decision=ADD）
+    - 攻击类型、评分、欺骗内容摘要
+    - 与正常拦截（decision=BLOCK）和正常对话（decision=ALLOW）的区分
+
+    参数：
+        limit:    每页条数（最大 200）
+        offset:   分页偏移
+        category: 按攻击类型过滤（可选），如 prompt_injection / jailbreak_gcg 等
+    """
+    from sqlalchemy import text
+    from app.db import _session_factory
+
+    limit = min(limit, 200)
+
+    if _session_factory is None:
+        raise HTTPException(status_code=503, detail="Database not available")
+
+    async with _session_factory() as session:
+        try:
+            if category:
+                rows_result = await session.execute(
+                    text(
+                        "SELECT request_id, user_id, timestamp, decision, blocked_by, "
+                        "blocked_reason, extra_data, duration_ms "
+                        "FROM audit_logs "
+                        "WHERE decision = 'ADD' "
+                        "AND JSON_UNQUOTE(JSON_EXTRACT(extra_data, '$.attack_category')) = :cat "
+                        "ORDER BY timestamp DESC LIMIT :lim OFFSET :off"
+                    ),
+                    {"cat": category, "lim": limit, "off": offset}
+                )
+            else:
+                rows_result = await session.execute(
+                    text(
+                        "SELECT request_id, user_id, timestamp, decision, blocked_by, "
+                        "blocked_reason, extra_data, duration_ms "
+                        "FROM audit_logs "
+                        "WHERE decision = 'ADD' "
+                        "ORDER BY timestamp DESC LIMIT :lim OFFSET :off"
+                    ),
+                    {"lim": limit, "off": offset}
+                )
+
+            rows = rows_result.fetchall()
+            import json as _json
+
+            records = []
+            for row in rows:
+                extra = row[6]
+                if isinstance(extra, str):
+                    try:
+                        extra = _json.loads(extra)
+                    except Exception:
+                        extra = {}
+                records.append({
+                    "request_id":    row[0],
+                    "user_id":       row[1],
+                    "timestamp":     row[2].isoformat() if row[2] else None,
+                    "decision":      row[3],
+                    "blocked_by":    row[4],
+                    "blocked_reason": row[5],
+                    "duration_ms":   row[7],
+                    # ADD 专有字段（从 extra_data 提取，便于前端直接渲染）
+                    "attack_category":         extra.get("attack_category"),
+                    "d_score":                 extra.get("d_score"),
+                    "h_score":                 extra.get("h_score"),
+                    "shadow_model_attempts":   extra.get("shadow_model_attempts"),
+                    "fallback_used":           extra.get("fallback_used"),
+                    "decoy_preview":           extra.get("decoy_preview"),
+                    "add_latency_ms":          extra.get("add_latency_ms"),
+                })
+
+            return {"total": len(records), "offset": offset, "limit": limit, "records": records}
+
+        except Exception as e:
+            logger.error(f"ADD logs query error: {e}")
+            raise HTTPException(status_code=500, detail={"error": str(e)})
 
 
 # ==================== 启动 ====================
