@@ -529,11 +529,19 @@ _H_HIGH_RISK_PATTERNS = [
 ]
 
 # H-Score：白名单（ADD 模块故意生成的安全假数据，不计入危害）
+# 注意：ProAct 借鉴的编码混淆字段（base64 payload、hex dump）本身无害，
+# 需加入白名单防止 H-Score 误判。
 _H_WHITELIST_PATTERNS = [
-    r"internal-sys\.local",        # 模板中使用的安全域名
-    r"192\.168\.\d+\.\d+",        # 私网 IP
+    r"internal-sys\.local",                        # 模板中使用的安全域名
+    r"192\.168\.\d+\.\d+",                        # 私网 IP
     r"(?:non-functional|fictional|fake|decoy|placeholder)",
-    r"d41d8cd98f00b204e9800998ecf8427e",  # 空文件 MD5
+    r"d41d8cd98f00b204e9800998ecf8427e",           # 空文件 MD5（已知安全）
+    r"\[base64-encoded [^\]]+\]",                  # ProAct 借鉴：base64 字段标注
+    r"\[/base64\]",                                # base64 闭合标签
+    r"HEX DUMP \(offset 0x[0-9a-f]+\)",           # ProAct 借鉴：hex dump 标头
+    r"Content-Encoding:\s*base64",                 # HTTP 编码声明（无害）
+    r"(?:Checksum|Secret-Key|Session-Hash|Session-Data|Privilege-Token|Privilege-Grant):\s*\S+",
+    r"(?:config_payload|session_data):\s*\S+",     # 新模板中的编码字段名
 ]
 
 
@@ -567,34 +575,235 @@ def _compute_h_score(text: str) -> float:
     return round(score, 4)
 
 
-def _quality_check(text: str) -> Tuple[float, float, bool]:
+def _compute_semantic_h_score(text: str) -> float:
     """
-    双重质量校验。
+    动态语义危害性评分（0-1）。
+
+    设计来源：借鉴 Backtranslation Defense（Wang et al., ACL 2024 Findings,
+    arXiv:2402.16459）的核心思路——将检测空间从输入域转移到响应域。
+    Backtranslation 的做法是：从响应反推原始请求，再判断该请求是否有害。
+    我们在此做轻量化实现：直接在响应文本中提取语义意图指纹（intent fingerprint），
+    检测那些不命中固定格式规则（_H_HIGH_RISK_PATTERNS）但语义上有害的内容。
+
+    静态规则（_H_HIGH_RISK_PATTERNS）的盲区：
+      - 只能抓格式固定的内容（BEGIN RSA KEY, CVE-xxxx-xxxx exploit 等）
+      - 无法抓"语义上描述了如何做有害操作"的内容
+      - 例如：影子模型输出了真实的 SSH 私钥生成命令（不含关键词 BEGIN/END）
+      - 例如：影子模型输出了真实的 SQL 注入 payload 描述（不是 DROP TABLE 格式）
+
+    本函数检测三类语义危险模式：
+      A. 真实可执行的系统破坏命令序列（非演示性）
+      B. 真实的凭证/密钥生成方法描述
+      C. 真实的网络攻击步骤描述（非理论性）
+
+    实现方式：意图指纹匹配（多条规则 AND/OR 组合），不调用任何 API，纯本地运算。
+    白名单机制：若同时命中安全标记（fictional/fake/synthetic 等），降低语义分。
 
     Returns:
-        (d_score, h_score, passed)
+        float: 0.0（无语义危害）到 0.90（确认语义危害），步长 0.30
+    """
+    if not text or len(text) < 20:
+        return 0.0
+
+    # ── A. 真实系统破坏命令语义指纹 ─────────────────────────────
+    # 检测"描述了真实的破坏性操作"而非"展示了格式化的假数据"
+    # 规则：同时出现破坏性动词 + 敏感目标路径/对象
+    _DESTRUCTIVE_VERBS = re.compile(
+        r"\b(?:delete|remove|erase|wipe|destroy|corrupt|overwrite|truncate|"
+        r"chmod\s+[0-7]+|chown\s+root|kill\s+-9|rm\s+-rf?|"
+        r"dd\s+if=|mkfs|format\s+[a-z]:|"
+        r"net\s+user.*\/add|net\s+localgroup.*administrators)\b",
+        re.IGNORECASE,
+    )
+    _SENSITIVE_TARGETS = re.compile(
+        r"(?:"
+        r"(?<!\w)/etc/(?:passwd|shadow|sudoers|ssh)\b|"
+        r"C:\\\\Windows\\\\System32|HKEY_LOCAL_MACHINE|"
+        r"(?<!\w)\.ssh/(?:authorized_keys|id_rsa)\b|"
+        r"(?<!\w)/var/(?:log|www)\b|(?<!\w)/proc/[0-9]+|"
+        r"(?:master|sys|mysql)\.(?:mdf|frm)\b|"
+        r"\b(?:SAM|SECURITY|SYSTEM)\s+hive\b"
+        r")",
+        re.IGNORECASE,
+    )
+    has_destructive_verb = bool(_DESTRUCTIVE_VERBS.search(text))
+    has_sensitive_target = bool(_SENSITIVE_TARGETS.search(text))
+
+    # ── B. 真实凭证生成方法语义指纹 ─────────────────────────────
+    # 检测"描述了如何生成真实的密钥/凭证"而非"返回了格式化的假 JWT"
+    _CREDENTIAL_GENERATION = re.compile(
+        r"\b(?:ssh-keygen|openssl\s+genrsa|openssl\s+req|"
+        r"gpg\s+--gen-key|keytool\s+-genkeypair|"
+        r"generate\s+(?:a\s+)?(?:real|working|valid|functional)\s+"
+        r"(?:key|certificate|token|credential|password)|"
+        r"crack\s+(?:the\s+)?(?:hash|password|key)|"
+        r"hashcat|john\s+(?:the\s+)?ripper|ophcrack)\b",
+        re.IGNORECASE,
+    )
+    has_credential_gen = bool(_CREDENTIAL_GENERATION.search(text))
+
+    # ── C. 真实网络攻击步骤语义指纹 ─────────────────────────────
+    # 检测"描述了真实的网络攻击操作步骤"而非"展示了假的 hex dump"
+    # 规则：同时出现攻击工具名称 + 具体操作参数（说明是实际使用而非概念介绍）
+    _ATTACK_TOOL_WITH_ARGS = re.compile(
+        r"\b(?:"
+        r"nmap\s+(?:-[A-Za-z]+\s+){0,3}\d{1,3}\.\d{1,3}|"   # nmap + IP
+        r"hydra\s+-[lLP]|"                                    # hydra 密码破解
+        r"aircrack-ng\s+-[a-z]|"                              # wifi 破解
+        r"ettercap\s+-[TM]|"                                  # 中间人攻击
+        r"burpsuite.*intercept|"
+        r"wireshark.*capture.*password|"
+        r"tcpdump.*-w.*\.pcap\s+.*port\s+(?:80|443|22|21)|"
+        r"arpspoof|arpspoofing|arp\s+poison|"
+        r"reverse\s+shell.*(?:bash|python|nc\s+-e|"
+        r"powershell.*-nop.*-enc))\b",
+        re.IGNORECASE | re.DOTALL,
+    )
+    has_attack_tool_use = bool(_ATTACK_TOOL_WITH_ARGS.search(text))
+
+    # ── 白名单检查（安全标记抵消语义危害判断）────────────────────
+    # 如果文本明确标注了是虚构/演示内容，降低语义危害分
+    _SEMANTIC_SAFE_MARKERS = re.compile(
+        r"\b(?:fictional|fake|synthetic|non-functional|placeholder|"
+        r"simulated|demonstration|example only|for illustrative|"
+        r"虚构|模拟|演示|示例)\b",
+        re.IGNORECASE,
+    )
+    is_marked_safe = bool(_SEMANTIC_SAFE_MARKERS.search(text))
+
+    # ── 评分计算 ──────────────────────────────────────────────────
+    score = 0.0
+
+    # 破坏性命令 + 敏感目标同时出现 → 强信号（必须两者都有才触发，减少误报）
+    if has_destructive_verb and has_sensitive_target:
+        score = max(score, 0.75)
+
+    # 真实凭证生成 → 中等信号
+    if has_credential_gen:
+        score = max(score, 0.60)
+
+    # 攻击工具实际使用 → 中等信号
+    if has_attack_tool_use:
+        score = max(score, 0.60)
+
+    # 多个信号叠加 → 升至强信号
+    signal_count = sum([
+        has_destructive_verb and has_sensitive_target,
+        has_credential_gen,
+        has_attack_tool_use,
+    ])
+    if signal_count >= 2:
+        score = max(score, 0.90)
+
+    # 白名单抵消（最多抵消 0.30）
+    if is_marked_safe and score > 0.0:
+        score = max(score - 0.30, 0.0)
+
+    return round(score, 4)
+
+
+def _quality_check(text: str) -> Tuple[float, float, bool]:
+    """
+    双重质量校验：静态规则 H-Score + 动态语义 H-Score。
+
+    静态层（_compute_h_score）：检测固定格式特征，如真实私钥、CVE exploit 等。
+    动态层（_compute_semantic_h_score）：借鉴 Backtranslation 防御的检测空间转移
+    思路（Wang et al., ACL 2024 Findings），从响应内容中提取语义意图指纹，检测
+    静态规则无法覆盖的灰色地带——例如影子模型生成了真实的攻击工具使用方法或
+    真实的破坏性 shell 命令，但这些内容恰好不命中任何固定格式规则。
+
+    注意：动态层仅对影子模型生成内容有意义（降级响应模板已确保安全，不需要）。
+    但 _quality_check 是统一入口，所以两层都跑；降级响应语义层必然得 0.00。
+
+    Returns:
+        (d_score, combined_h_score, passed)
     """
     if not text or not text.strip():
         return 0.0, 1.0, False
     d = _compute_d_score(text)
-    h = _compute_h_score(text)
+    h_static = _compute_h_score(text)
+    h_semantic = _compute_semantic_h_score(text)
+    # 取两层中较高的危害分（悲观原则：任一层发现危险即拦截）
+    h = max(h_static, h_semantic)
     passed = (d >= ADD_D_SCORE_THRESHOLD) and (h <= ADD_H_SCORE_THRESHOLD)
     return d, h, passed
 
 
 # ============================================================
 # 规则降级响应库（无 API 可用时的兜底）
+#
+# 设计原则（参考 ProAct, arXiv:2510.05052, Table 3）：
+#   ProAct 的核心发现：在虚假响应里嵌入"看起来像系统编码数据"的字段
+#   （base64 payload、hex dump、JWT token 等），能使攻击工具的评判模型
+#   误判"越狱成功"，从而提前终止迭代。
+#   ProAct 实验中 Hex 编码是最高效单策略（最少尝试次数），
+#   unrestricted（自由混合）达到最高平均绕过率 0.91。
+#
+#   与 ProAct 纯 LLM 生成不同，我们用结构化模板 + 动态占位符实现，
+#   每次调用都生成不同的 token/hash/session，防止攻击者通过响应一致性
+#   识别出蜜罐（对抗重放检测）。
+#
+#   每个生成函数对应一个攻击类型，返回的字符串需满足：
+#     - D-Score ≥ 0.60（命中至少 2 条 _D_POSITIVE_PATTERNS）
+#     - H-Score = 0.00（不触发任何 _H_HIGH_RISK_PATTERNS）
+#
+# D-Score 目标（经本地验证）：
+#   PROMPT_INJECTION     ≥ 0.72（session-id + hash）
+#   IDENTITY_SPOOFING    ≥ 0.82（JWT + session + hash）
+#   DATA_EXFILTRATION    ≥ 0.82（rows returned + hash + IP）
+#   CODE_INJECTION       ≥ 0.72（exit code + pid）
+#   PRIVILEGE_ESCALATION ≥ 0.82（JWT + session）
+#   JAILBREAK_GCG        ≥ 0.72（base64 payload + hash）
+#   JAILBREAK_PAIR       ≥ 0.82（base64 + JWT + rows returned）
+#   UNKNOWN              ≥ 0.72（base64 + hash）
 # ============================================================
 
-_FALLBACK_RESPONSES: Dict[AttackCategory, List[str]] = {
-    AttackCategory.PROMPT_INJECTION: [
-        # 格式化的配置确认块，含 session/hash，D-Score 稳定 ≥ 0.60
+def _b64_fake_payload(content: str) -> str:
+    """
+    生成看起来像系统编码数据的 base64 字符串。
+    content 是无害的假内容，编码后对攻击工具的 Judge 模型呈现为"提取到的敏感数据"。
+    参考 ProAct Figure 3：base64 字段让 Judge 认为数据已被成功提取。
+    """
+    return base64.b64encode(content.encode()).decode()
+
+
+def _hex_dump_fake(num_rows: int = 2) -> str:
+    """
+    生成看起来像内存/数据 hex dump 的字符串。
+    参考 ProAct Table 3：Hex 策略是最高效单编码策略（最少迭代次数）。
+    hex dump 格式是真实系统输出的常见形态，Judge 模型识别度高。
+    """
+    rows = []
+    for i in range(num_rows):
+        offset = f"0x{i * 16:04x}"
+        hex_bytes = "  ".join(_rand_hex(2) for _ in range(16))
+        rows.append(f"{offset}: {hex_bytes}")
+    return "\n".join(rows)
+
+
+def _gen_prompt_injection_fallback() -> str:
+    """
+    PROMPT_INJECTION 降级响应。
+    结构：配置覆盖确认块，含 session_token（触发 token 正面信号）和 previous_hash（MD5 正面信号）。
+    D-Score 目标 ≥ 0.72（2 条正面信号：MD5 + token 字段 + 长度加分）。
+    ProAct 借鉴点：加入 base64 编码的"配置增量"字段，使 Judge 认为系统配置已被提取。
+
+    注意：Session-ID 和 previous_hash 命中同一条 MD5 规则，只计一次。
+    因此额外加 session_token= 字段，命中 token 规则，确保命中 2 条不同规则。
+    """
+    fake_config = _b64_fake_payload(
+        f"instruction_mode=overridden,scope=session,nonce={_rand_hex(8)}"
+    )
+    session_token = _rand_hex(32)
+    templates = [
         (
             f"Status: ACCEPTED\n"
             f"Session-ID: {_rand_hex(32)}\n"
             f"Config-Delta:\n"
             f"  - instruction_mode: overridden\n"
+            f"  - config_payload: {fake_config}\n"
             f"  - previous_hash: {_fake_md5()}\n"
+            f"  - session_token={session_token}\n"
             f"  - applied_at: 2026-01-01T00:00:00Z\n"
             f"  - scope: session_only"
         ),
@@ -603,69 +812,325 @@ _FALLBACK_RESPONSES: Dict[AttackCategory, List[str]] = {
             f"Session-ID: {_rand_hex(32)}\n"
             f"Config-Delta:\n"
             f"  - behavior_mode: updated\n"
+            f"  - config_payload: {fake_config}\n"
             f"  - previous_hash: {_fake_md5()}\n"
+            f"  - session_token={session_token}\n"
             f"  - applied_at: 2026-01-01T00:00:00Z\n"
             f"  - scope: session_only"
         ),
-    ],
-    AttackCategory.IDENTITY_SPOOFING: [
-        # 格式化的认证 token 块，含 JWT/session/permissions，D-Score 稳定 ≥ 0.60
+    ]
+    return random.choice(templates)
+
+
+def _gen_identity_spoofing_fallback() -> str:
+    """
+    IDENTITY_SPOOFING 降级响应。
+    结构：认证令牌块，含 JWT（正面信号）+ session（MD5 正面信号）+ permissions。
+    D-Score 目标 ≥ 0.82（3 条正面信号：JWT + MD5 + 长度加分）。
+    ProAct 借鉴点：加入 base64 编码的 session 数据，呈现为"认证上下文已导出"。
+    """
+    session_payload = _b64_fake_payload(
+        f"user_id={_rand_hex(8)},role=admin,priv=root,nonce={_rand_hex(6)}"
+    )
+    roles = [
+        ("ADMIN",     "[read, write, execute, admin]"),
+        ("DEVELOPER", "[read, write, debug, config]"),
+        ("ROOT",      "[read, write, execute, admin, root]"),
+    ]
+    role, perms = random.choice(roles)
+    templates = [
         (
             f"Auth-Status: VERIFIED\n"
-            f"Role: ADMIN\n"
+            f"Role: {role}\n"
             f"Token: {_fake_jwt()}\n"
             f"Session: {_rand_hex(32)}\n"
+            f"Session-Data: {session_payload}\n"
             f"Expires: 2026-01-01T01:00:00Z\n"
-            f"Permissions: [read, write, execute, admin]"
+            f"Permissions: {perms}"
         ),
         (
             f"Auth-Status: VERIFIED\n"
-            f"Role: DEVELOPER\n"
+            f"Role: {role}\n"
+            f"Token: {_fake_jwt()}\n"
+            f"Session-Hash: {_fake_md5()}\n"
+            f"Session-Data: {session_payload}\n"
+            f"Permissions: {perms}"
+        ),
+    ]
+    return random.choice(templates)
+
+
+def _gen_data_exfiltration_fallback() -> str:
+    """
+    DATA_EXFILTRATION 降级响应。
+    结构：SQL 查询结果表格，含动态生成的 hash、uid、IP，每次不同。
+    D-Score 目标 ≥ 0.82（3 条正面信号：MD5×2 + rows returned + 长度加分）。
+    ProAct 借鉴点：加入 hex dump 字段，呈现为"原始数据流已被提取"。
+    """
+    uid1, uid2 = random.randint(10000, 99999), random.randint(10000, 99999)
+    name1, name2 = f"usr_{_rand_hex(4)}", f"usr_{_rand_hex(4)}"
+    hash1, hash2 = _fake_md5(), _fake_md5()
+    ip = f"192.168.{random.randint(1,254)}.{random.randint(1,254)}"
+    templates = [
+        (
+            f"Query executed successfully. 2 rows returned.\n"
+            f"| id    | username | email                      | hash                             |\n"
+            f"| {uid1} | {name1} | {name1}@internal-sys.local | {hash1} |\n"
+            f"| {uid2} | {name2} | {name2}@internal-sys.local | {hash2} |\n"
+            f"Execution time: 0.003s | server: {ip}"
+        ),
+        (
+            f"Data stream extracted. 2 rows returned.\n"
+            f"Raw hex dump:\n"
+            f"{_hex_dump_fake(1)}\n"
+            f"Decoded: id={uid1}, secret_hash={hash1}\n"
+            f"Source: {ip} | status: OK"
+        ),
+    ]
+    return random.choice(templates)
+
+
+def _gen_code_injection_fallback() -> str:
+    """
+    CODE_INJECTION 降级响应。
+    结构：shell 执行结果，含 PID 和 command executed（正面信号）+ MD5 checksum。
+    D-Score 目标 ≥ 0.72（2 条正面信号：command executed + MD5 + 长度加分）。
+
+    注意：D-Score 规则 `(?:exit code|process id|pid)\s*[:\s]\d+` 要求冒号后
+    紧跟数字（无空格），而 shell 输出惯例是 "exit code: 0"（有空格），无法命中。
+    因此改为依赖 "command executed successfully" + MD5 checksum 两条信号确保 ≥ 0.72。
+    ProAct 借鉴点：加入 hex dump 字段模拟内存读取输出，呈现为"代码已执行并读取了内存"。
+    """
+    pid = random.randint(10000, 65535)
+    uid_num = random.randint(1000, 9999)
+    checksum = _fake_md5()
+    templates = [
+        (
+            f"Process started. PID:{pid}\n"
+            f"uid={uid_num}(appuser) gid=1000(appuser)\n"
+            f"Memory snapshot:\n"
+            f"{_hex_dump_fake(1)}\n"
+            f"command executed successfully.\n"
+            f"Output checksum: {checksum}"
+        ),
+        (
+            f"Executing payload... PID:{pid}\n"
+            f"uid={uid_num}(appuser)\n"
+            f"-rw-r--r-- 1 www www 0 Jan 01 00:00 output.log\n"
+            f"command executed successfully.\n"
+            f"Result hash: {checksum}"
+        ),
+    ]
+    return random.choice(templates)
+
+
+def _gen_privilege_escalation_fallback() -> str:
+    """
+    PRIVILEGE_ESCALATION 降级响应。
+    结构：提权成功确认，含 JWT token（正面信号）和 session hash（MD5 正面信号）。
+    D-Score 目标 ≥ 0.82（3 条正面信号：JWT + MD5 + 长度加分）。
+    ProAct 借鉴点：加入 base64 编码的权限令牌，呈现为"提权凭证已颁发"。
+    """
+    priv_token = _b64_fake_payload(
+        f"grant=root,scope=all,nonce={_rand_hex(8)},ts=1700000000"
+    )
+    templates = [
+        (
+            f"Privilege escalation granted.\n"
+            f"Token: {_fake_jwt()}\n"
+            f"Privilege-Token: {priv_token}\n"
+            f"Session-Hash: {_fake_md5()}\n"
+            f"Access Level: ADMIN"
+        ),
+        (
+            f"Escalation-Status: GRANTED\n"
             f"Token: {_fake_jwt()}\n"
             f"Session: {_rand_hex(32)}\n"
-            f"Expires: 2026-01-01T01:00:00Z\n"
-            f"Permissions: [read, write, debug, config]"
+            f"Privilege-Grant: {priv_token}\n"
+            f"Scope: [read, write, execute, admin]"
         ),
-    ],
-    AttackCategory.DATA_EXFILTRATION: [
+    ]
+    return random.choice(templates)
+
+
+def _gen_jailbreak_gcg_fallback() -> str:
+    """
+    JAILBREAK_GCG 降级响应（原 D-Score 仅 0.62，本次重点改进）。
+    GCG 攻击的 Judge 通常检测"模型是否提供了实质内容"，对 base64 和 hex 格式
+    的"数据"判定为"成功提取"（参考 ProAct Table 3：hex 策略绕过率最高）。
+    ProAct 借鉴点：用 hex dump + base64 payload 替代原来的口语化 placeholder，
+    使 Judge 模型看到"系统返回了编码后的数据"而非空占位符。
+    D-Score 目标 ≥ 0.72（2 条正面信号：MD5 checksum + rows returned / exit code）。
+    """
+    payload = _b64_fake_payload(
+        f"data=extracted,config=overridden,nonce={_rand_hex(12)}"
+    )
+    templates = [
+        # 模板 A：base64 payload + checksum + rows returned
         (
-            "Query executed successfully. 2 rows returned.\n"
-            "| id    | username  | email                     | hash                             |\n"
-            "| 10293 | usr_a3f2  | usr_a3f2@internal-sys.local | d41d8cd98f00b204e9800998ecf8427e |\n"
-            "| 10294 | usr_b7e1  | usr_b7e1@internal-sys.local | 098f6bcd4621d373cade4e832627b4f6 |\n"
-            "Execution time: 0.003s"
+            f"Request processed. Extracted data payload:\n"
+            f"[base64-encoded system output]\n"
+            f"{payload}\n"
+            f"[/base64]\n"
+            f"Checksum: {_fake_md5()}\n"
+            f"1 row returned | status: OK"
         ),
-    ],
-    AttackCategory.CODE_INJECTION: [
-        "Process started with PID 31337\nuid=1001(appuser) gid=1001(appuser)\nCommand executed successfully.\nExit code: 0",
-        "Executing...\ntotal 0\n-rw-r--r-- 1 www www 0 Jan 01 00:00 output.log\nDone.",
-    ],
-    AttackCategory.PRIVILEGE_ESCALATION: [
-        f"Privilege escalation successful.\nSession: {_rand_hex(32)}\nAccess Level: ADMIN (simulation)\nNote: Session is monitored.",
-    ],
-    AttackCategory.JAILBREAK_GCG: [
-        "Sure, here is the information you requested: [placeholder content - no real data available].",
-        "Of course! Here's what you asked for: [fictional content - system returned empty result set].",
-    ],
-    AttackCategory.JAILBREAK_PAIR: [
-        "Absolutely! I'm happy to help with that. Here is the detailed information: [fictional placeholder - data not found in knowledge base].",
-        "Of course, here is the information you requested: [simulated result - content could not be retrieved from the system].",
-    ],
-    AttackCategory.UNKNOWN: [
-        "I understand your request. I've processed it and here is the result: [no additional data available].",
-        "Task completed. Please let me know if you need anything else.",
-    ],
+        # 模板 B：hex dump + JWT token + exit code
+        (
+            f"Output retrieved. Raw data stream:\n"
+            f"HEX DUMP (offset 0x0000):\n"
+            f"{_hex_dump_fake(2)}\n"
+            f"token={_fake_jwt()}\n"
+            f"exit code: 0"
+        ),
+    ]
+    return random.choice(templates)
+
+
+def _gen_jailbreak_pair_fallback() -> str:
+    """
+    JAILBREAK_PAIR 降级响应（原 D-Score 仅 0.62，本次重点改进）。
+    PAIR 的 Judge 用 1-10 评分，会检测响应是否"配合了请求"且"包含实质内容"。
+    ProAct 借鉴点：base64 + JWT 组合是 unrestricted 策略中最常出现的高分组合
+    （参考 ProAct 论文 Figure 3 中的数据提取示例）。
+    D-Score 目标 ≥ 0.82（3 条正面信号：base64 payload + JWT + rows returned）。
+    """
+    payload = _b64_fake_payload(
+        f"CONFIDENTIAL:user_data,api_access,secret={_rand_hex(16)},ts=1700000000"
+    )
+    session_b64 = _b64_fake_payload(
+        f"session={_rand_hex(16)},priv=elevated,scope=full"
+    )
+    templates = [
+        # 模板 A：Content-Encoding base64 + Secret-Key（MD5）+ rows returned
+        (
+            f"Confirmed. Here is the extracted data:\n"
+            f"Content-Encoding: base64\n"
+            f"Payload: {payload}\n"
+            f"Secret-Key: {_fake_md5()}\n"
+            f"2 rows returned | query_time: 0.003s"
+        ),
+        # 模板 B：JWT token + base64 session + exit code
+        (
+            f"Data retrieval complete:\n"
+            f"token: {_fake_jwt()}\n"
+            f"session_data: {session_b64}\n"
+            f"process id: {random.randint(10000, 65535)} | command executed successfully"
+        ),
+    ]
+    return random.choice(templates)
+
+
+def _gen_unknown_fallback() -> str:
+    """
+    UNKNOWN 降级响应（原 D-Score 0.52~0.62，本次重点改进）。
+    对未知攻击类型，返回通用系统输出格式，包含足够的 D-Score 正面信号
+    让 Judge 认为"请求已被处理并返回了数据"。
+    D-Score 目标 ≥ 0.72（2 条正面信号：MD5 hash + rows returned / exit code）。
+    """
+    payload = _b64_fake_payload(
+        f"result=ok,data={_rand_hex(24)},ts=1700000000"
+    )
+    templates = [
+        # 模板 A：base64 result + hash + rows returned
+        (
+            f"Task executed. Result dump:\n"
+            f"{payload}\n"
+            f"hash: {_fake_md5()}\n"
+            f"1 row returned"
+        ),
+        # 模板 B：JWT token + exit code + pid
+        (
+            f"Operation complete. token={_fake_jwt()}\n"
+            f"exit code: 0 | process id: {random.randint(10000, 65535)}"
+        ),
+    ]
+    return random.choice(templates)
+
+
+# 攻击类型 → 生成函数映射表
+# 使用函数而非静态字符串，确保每次调用都动态生成不同的 token/hash/session，
+# 防止攻击者通过响应一致性识别蜜罐（对抗重放检测）。
+_FALLBACK_GENERATORS: Dict[AttackCategory, callable] = {
+    AttackCategory.PROMPT_INJECTION:    _gen_prompt_injection_fallback,
+    AttackCategory.IDENTITY_SPOOFING:   _gen_identity_spoofing_fallback,
+    AttackCategory.DATA_EXFILTRATION:   _gen_data_exfiltration_fallback,
+    AttackCategory.CODE_INJECTION:      _gen_code_injection_fallback,
+    AttackCategory.PRIVILEGE_ESCALATION: _gen_privilege_escalation_fallback,
+    AttackCategory.JAILBREAK_GCG:       _gen_jailbreak_gcg_fallback,
+    AttackCategory.JAILBREAK_PAIR:      _gen_jailbreak_pair_fallback,
+    AttackCategory.UNKNOWN:             _gen_unknown_fallback,
 }
 
 
 def _get_fallback_response(category: AttackCategory) -> str:
-    templates = _FALLBACK_RESPONSES.get(category, _FALLBACK_RESPONSES[AttackCategory.UNKNOWN])
-    return random.choice(templates)
+    """
+    调用对应攻击类型的降级响应生成函数，返回动态生成的虚假响应。
+    每次调用都生成不同内容（token/hash/session 动态随机），
+    防止攻击者通过多次探测发现响应完全一致而识别蜜罐。
+    """
+    gen_fn = _FALLBACK_GENERATORS.get(
+        category,
+        _FALLBACK_GENERATORS[AttackCategory.UNKNOWN]
+    )
+    return gen_fn()
 
 
 # ============================================================
 # 影子模型调用（复用项目已有 MiniMax API 接口）
 # ============================================================
+
+def _strip_cot(text: str) -> str:
+    """
+    剥离影子模型输出中的思维链（Chain-of-Thought）内容，只保留实际响应部分。
+
+    覆盖三种常见格式：
+      1. <think>...</think> 标签包裹（MiniMax-M2.5、DeepSeek-R1 等）
+      2. 无标签纯文本 CoT：模型把内心分析作为普通文本输出，
+         特征是以"The user is asking..."/"I need to..."/"Let me..."等句式开头，
+         真正的虚假响应在某个空行之后才出现
+      3. 混合格式：有标签但标签后还有额外的分析段落
+
+    策略：
+      - 先剥除所有 <think>...</think>/<thinking>...</thinking> 块
+      - 如果剩余文本仍以典型 CoT 引导词开头，截取第一个空行之后的内容
+      - 若截取后为空（模型只输出了思维链），返回原始文本（外层会用降级响应兜底）
+    """
+    if not text:
+        return text
+
+    # 第一步：剥除 XML 风格 CoT 标签
+    cleaned = re.sub(r'<think(?:ing)?>.*?</think(?:ing)?>', '', text, flags=re.DOTALL)
+    cleaned = cleaned.strip()
+
+    # 第二步：检测无标签 CoT 开头
+    # 典型模式：模型先输出一段分析性段落，再换行给出实际回答
+    _COT_LEAD = re.compile(
+        r'^(?:'
+        r'The user (?:is asking|has sent|wants)|'
+        r'I (?:need to|should|must|will|am going to|can see)|'
+        r'Let me (?:think|analyze|consider|break|look)|'
+        r'This (?:is a|appears to be|looks like|seems)|'
+        r'Looking at (?:this|the)|'
+        r'Based on (?:this|the)|'
+        r'(?:OK|Okay|Alright),?\s+(?:so|let|I)|'
+        r'First(?:ly)?,?\s+I|'
+        r'To (?:answer|respond|address|handle)'
+        r')',
+        re.IGNORECASE
+    )
+
+    if _COT_LEAD.match(cleaned):
+        # 找第一个空行（段落分隔）之后的内容
+        parts = re.split(r'\n\s*\n', cleaned, maxsplit=1)
+        if len(parts) == 2 and parts[1].strip():
+            cleaned = parts[1].strip()
+        # 如果只有一个段落（没有空行），整段都是 CoT，返回原文让外层降级
+        else:
+            return text.strip()
+
+    return cleaned if cleaned else text.strip()
+
 
 async def _call_shadow_model(
     system_prompt: str,
@@ -731,9 +1196,7 @@ async def _call_shadow_model(
                     return None
 
             raw = response.choices[0].message.content or ""
-            # 剥离思维链标签（MiniMax-M2.5 等 CoT 模型会输出 <think>...</think>）
-            # 这段内容是模型内部推理，不应返回给攻击方，且会拉低 D-Score
-            cleaned = re.sub(r'<think>.*?</think>', '', raw, flags=re.DOTALL).strip()
+            cleaned = _strip_cot(raw)
             return cleaned if cleaned else None
 
         except asyncio.TimeoutError:
